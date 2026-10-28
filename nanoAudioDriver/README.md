@@ -1,4 +1,4 @@
-# Universal WASAPI Low-Latency ASIO Driver
+# nanoAudio — Universal WASAPI Low-Latency ASIO Driver
 
 Driver ASIO universal em C++ (COM In-Process Server 64-bit/32-bit) projetado para Windows 10 e Windows 11, construído sobre a API nativa [**IAudioClient3 (WASAPI Low Latency)**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio) e compatível com a especificação binária do [**Steinberg ASIO SDK 2.3**](https://www.steinberg.net/developers/asiosdk-open/).
 
@@ -62,7 +62,7 @@ O instalador:
 Dê um duplo clique no script:
 * **`Compilar_e_Gerar_Instalador.bat`**
 
-Ele compila as versões estáticas (64-bit e 32-bit) e gera automaticamente o arquivo `UniversalWasapiAsio_Setup_v2.3.0.exe` dentro da pasta `Output\`.
+Ele compila as versões estáticas (64-bit e 32-bit) e gera automaticamente o arquivo `nanoAudio_Setup_v2.5.0.exe` dentro da pasta `Output\`.
 
 ---
 
@@ -103,6 +103,6 @@ O driver inclui um Painel de Controle nativo em Win32 que pode ser aberto tanto 
 
 ## Como Configurar nas Principais DAWs
 
-* **Reaper, FL Studio, Cubase e Studio One:** Abra as preferências de áudio da DAW, escolha **ASIO** como tipo de driver e selecione **Universal WASAPI Low-Latency ASIO**. Clique no botão **Control Panel / Show ASIO Panel** para abrir o Painel de Controle gráfico e configurar entrada, saída, sample rate, resolução e latência. Ao clicar em **Salvar & Aplicar**, o driver reconfigura a DAW automaticamente via `kAsioResetRequest`.
+* **Reaper, FL Studio, Cubase e Studio One:** Abra as preferências de áudio da DAW, escolha **ASIO** como tipo de driver e selecione **nanoAudio** (ou **nanoAudio ASIO**). Clique no botão **Control Panel / Show ASIO Panel** para abrir o Painel de Controle gráfico e configurar entrada, saída, sample rate, resolução e latência. Ao clicar em **Salvar & Aplicar**, o driver reconfigura a DAW automaticamente via `kAsioResetRequest`.
 
 * **Ableton Live e Pro Tools:** Desinstale o ASIO4ALL antes de abrir o Ableton Live ou o Pro Tools para evitar que o ASIO4ALL trave o dispositivo de áudio ao ser sondado em paralelo. O driver já opera com formato unificado `ASIOSTFloat32LSB` na entrada e na saída, exigido pelo Pro Tools.

@@ -1,11 +1,11 @@
 @echo off
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
-title Gerador do Instalador — Universal WASAPI Low-Latency ASIO Driver
+title Gerador do Instalador — nanoAudio ASIO Driver
 
 echo ============================================================================
 echo   GERADOR DE INSTALADOR EXECUTÁVEL (.EXE) COM PAINEL DE CONTROLE
-echo   Universal WASAPI Low-Latency ASIO Driver
+echo   nanoAudio ASIO Driver
 echo ============================================================================
 echo.
 

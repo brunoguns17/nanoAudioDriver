@@ -1,10 +1,10 @@
 @echo off
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
-title Instalador — Universal WASAPI Low-Latency ASIO Driver
+title Instalador — nanoAudio ASIO Driver
 
 echo ============================================================================
-echo   INSTALADOR: Universal WASAPI Low-Latency ASIO Driver (Windows 10 / 11)
+echo   INSTALADOR: nanoAudio ASIO Driver (Windows 10 / 11)
 echo ============================================================================
 echo.
 
@@ -110,7 +110,7 @@ if exist "%INSTALL_DIR%\%DLL32_NAME%" (
 echo.
 echo ============================================================================
 echo   SUCESSO! Driver e Painel de Controle instalados com sucesso!
-echo   Nome na DAW: Universal WASAPI Low-Latency ASIO
+echo   Nome na DAW: nanoAudio
 echo   Localizacao: %INSTALL_DIR%\%DLL_NAME%
 echo ============================================================================
 echo.
