@@ -1,0 +1,6 @@
+# Scripts do Windows precisam de CRLF (cmd.exe tem bugs com goto/labels em arquivos LF)
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+*.exe binary
+*.dll binary

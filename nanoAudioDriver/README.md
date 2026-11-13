@@ -18,6 +18,12 @@ Driver ASIO universal em C++ (COM In-Process Server 64-bit/32-bit) projetado par
 
 * `nanoAudioDriver.cpp`: Implementação completa do motor WASAPI (`IAudioClient3`), detecção dinâmica de buffer por hardware, thread de áudio *Pro Audio*, painel de controle Win32 (`IASIO::controlPanel`) e auto-registro no Registro do Windows (`DllRegisterServer`).
 
+* `nanoAudioConfig.cpp` / `nanoAudioConfigMain.cpp`: Painel de controle gráfico (usado pela DLL dentro da DAW e pelo `nanoAudioControlPanel.exe`).
+
+* `nanoAudioUpdater.cpp`: Atualizador automático (`nanoAudioUpdater.exe`), que consulta as releases do GitHub.
+
+* `nanoAudioVersion.h`: Fonte única da versão e do repositório do GitHub usado pelo atualizador.
+
 * `CMakeLists.txt`: Configuração de build CMake para Visual Studio 2019/2022.
 
 ## Como Compilar no Windows
@@ -48,13 +54,13 @@ cl /LD /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioDriver.cpp ole32.lib uuid.lib avr
 ## Como Instalar o Driver
 
 ### 1. Instalador Gráfico Oficial (.exe) — Recomendado para Usuários Finais
-Basta executar o instalador executável gerado:
-* **`Output\nanoAudio_Setup_v2.5.0.exe`**
+Baixe o instalador `nanoAudio_Setup_vX.Y.Z.exe` na [página de releases](https://github.com/brunoguns17/nanoAudioDriver/releases/latest) e execute-o.
 
 O instalador:
 * Instala os drivers nativos **64-bit** e **32-bit** em `C:\Program Files\nanoAudio`.
 * Registra automaticamente o servidor COM e as entradas ASIO para todas as DAWs (64-bit e 32-bit).
 * Adiciona a opção de desinstalação padrão no menu "Configurações > Aplicativos > Aplicativos Instalados" (ou Painel de Controle) do Windows.
+* Instala o atualizador automático (opção **"Atualizar automaticamente"**, marcada por padrão). Veja [Atualizações Automáticas](#atualizações-automáticas).
 
 ---
 
@@ -62,7 +68,19 @@ O instalador:
 Dê um duplo clique no script:
 * **`Compilar_e_Gerar_Instalador.bat`**
 
-Ele compila as versões estáticas (64-bit e 32-bit) e gera automaticamente o arquivo `nanoAudio_Setup_v2.5.0.exe` dentro da pasta `Output\`.
+Ele compila as versões estáticas (64-bit e 32-bit), o painel e o atualizador, e gera o arquivo `nanoAudio_Setup_vX.Y.Z.exe` (versão lida de `nanoAudioVersion.h`) dentro da pasta `Output\`.
+
+---
+
+### 2.1. Publicar uma Nova Versão no GitHub (Para Desenvolvedores)
+Dê um duplo clique em **`Publicar_Release.bat`**, digite a nova versão (ex.: `2.6.1`) e, se quiser, as notas da release. O script [`Publicar_Release.ps1`](Publicar_Release.ps1):
+1. Confere se o `gh` está logado, se não há alterações pendentes no git e se a versão ainda não foi publicada.
+2. Grava a versão em `nanoAudioVersion.h`, compila tudo e gera o instalador (qualquer erro interrompe o processo).
+3. Gera o `update-manifest.txt` (versão, nome do instalador e SHA-256).
+4. Faz o commit, cria a tag `vX.Y.Z` e envia ao GitHub.
+5. Cria a release como rascunho, envia os arquivos, baixa de volta para conferir o SHA-256 e só então publica.
+
+Requisitos: [GitHub CLI](https://cli.github.com/) autenticado (`gh auth login`), Clang/LLVM-MinGW e Inno Setup 6.
 
 ---
 
@@ -71,11 +89,15 @@ Se preferir instalar diretamente a partir dos arquivos locais:
 * Execute como Administrador: **`Instalar_e_Compilar_Driver.bat`**
 * Para remover: **`Desinstalar_Driver.bat`**
 
+Esse modo não instala o atualizador automático.
+
 ---
 
 ## Painel de Controle Gráfico Integrado
 
 O driver inclui um Painel de Controle nativo em Win32 que pode ser aberto tanto de **dentro de qualquer DAW** (ao clicar em *Control Panel* / *Driver Settings*) quanto diretamente pelo **Menu Iniciar** ou área de trabalho via **`nanoAudioControlPanel.exe`**.
+
+O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo WASAPI à direita) e mostra no cabeçalho a **latência estimada de ida e volta**, recalculada ao vivo conforme o buffer, o sample rate e o modo escolhidos (verde até 10 ms, amarelo até 25 ms, vermelho acima disso). A janela usa o visual moderno do Windows; o `nanoAudioControlPanel.exe` fica nítido em telas com zoom de 125%, 150% etc. (dentro da DAW, a nitidez depende do modo de DPI da própria DAW).
 
 ### O que pode ser configurado:
 1. **🎧 Saída de Áudio (Playback):** Escolha qual placa ou interface reproduz o som (ex: *BEHRINGER USB Audio*, *Alto-falantes Realtek*, etc.) ou mantenha no *Padrão do Windows*.
@@ -101,8 +123,26 @@ O driver inclui um Painel de Controle nativo em Win32 que pode ser aberto tanto 
 
 ---
 
+## Atualizações Automáticas
+
+A partir da versão 2.6.0, o instalador oficial inclui o `nanoAudioUpdater.exe` e cria a tarefa agendada **`\nanoAudio\Atualizador automatico`**. Ela roda ao iniciar o Windows (depois de 5 minutos) e diariamente às 12:00 (ou assim que possível, se o PC estiver desligado nesse horário). A cada execução, o atualizador:
+
+1. Consulta `https://github.com/brunoguns17/nanoAudioDriver/releases/latest/download/update-manifest.txt` (somente HTTPS; nenhum dado pessoal é enviado).
+2. Se houver versão mais nova, baixa o instalador da release e confere o SHA-256 informado no manifesto.
+3. **Só instala se nenhum programa estiver usando o driver** (DAW ou painel abertos). Caso contrário, tenta de novo na próxima execução. O atualizador nunca fecha a sua DAW.
+4. Executa o instalador em modo silencioso.
+
+Também dá para verificar manualmente pelo botão **Verificar atualizações** no Painel de Controle ou pelo atalho no Menu Iniciar.
+
+* **Desativar:** reinstale e desmarque **"Atualizar automaticamente"**, ou desative a tarefa no Agendador de Tarefas do Windows.
+* **Logs:** `C:\ProgramData\nanoAudio\update.log` (verificação automática) e `%LOCALAPPDATA%\nanoAudio\update.log` (verificação manual).
+* **Versões anteriores à 2.6.0** não têm o atualizador: instale a 2.6.0 manualmente uma vez. Daí em diante, as atualizações chegam sozinhas.
+* **Segurança:** o atualizador instala, com privilégios de administrador, o que for publicado nas releases deste repositório. Proteja a conta do GitHub com autenticação em dois fatores.
+
+---
+
 ## Como Configurar nas Principais DAWs
 
-* **Reaper, FL Studio, Cubase e Studio One:** Abra as preferências de áudio da DAW, escolha **ASIO** como tipo de driver e selecione **nanoAudio** (ou **nanoAudio ASIO**). Clique no botão **Control Panel / Show ASIO Panel** para abrir o Painel de Controle gráfico e configurar entrada, saída, sample rate, resolução e latência. Ao clicar em **Salvar & Aplicar**, o driver reconfigura a DAW automaticamente via `kAsioResetRequest`.
+* **Reaper, FL Studio, Cubase e Studio One:** Abra as preferências de áudio da DAW, escolha **ASIO** como tipo de driver e selecione **nanoAudio** (ou **nanoAudio ASIO**). Clique no botão **Control Panel / Show ASIO Panel** para abrir o Painel de Controle gráfico e configurar entrada, saída, sample rate, resolução e latência. Ao clicar em **Salvar e aplicar**, o driver reconfigura a DAW automaticamente via `kAsioResetRequest`.
 
 * **Ableton Live e Pro Tools:** Desinstale o ASIO4ALL antes de abrir o Ableton Live ou o Pro Tools para evitar que o ASIO4ALL trave o dispositivo de áudio ao ser sondado em paralelo. O driver já opera com formato unificado `ASIOSTFloat32LSB` na entrada e na saída, exigido pelo Pro Tools.

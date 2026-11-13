@@ -1,19 +1,28 @@
 ; ============================================================================
 ; Installer_Setup.iss
 ; Script Inno Setup 6 para gerar o instalador executável oficial do Driver ASIO
-; nanoAudio ASIO Driver (32-bit e 64-bit + Painel de Controle Integrado v2.5)
+; nanoAudio ASIO Driver (32-bit e 64-bit + Painel de Controle + Atualizador)
+;
+; Compile pelo Compilar_e_Gerar_Instalador.bat: ele lê a versão em
+; nanoAudioVersion.h e a repassa com /DAppVersion=x.y.z.
 ; ============================================================================
 
+#ifndef AppVersion
+  #error "AppVersion não definido. Use Compilar_e_Gerar_Instalador.bat (ele passa /DAppVersion a partir de nanoAudioVersion.h)."
+#endif
+
 #define AppName "nanoAudio ASIO Driver"
-#define AppVersion "2.5.0"
 #define AppPublisher "nanoAudio Audio Project"
 #define AppId "{{8E6A2A41-5C3B-4F92-9A1D-7E3F9B02C4D8}"
+#define PowerShellExe "{sys}\WindowsPowerShell\v1.0\powershell.exe"
 
 [Setup]
 AppId={#AppId}
 AppName={#AppName}
 AppVersion={#AppVersion}
+AppVerName={#AppName} {#AppVersion}
 AppPublisher={#AppPublisher}
+VersionInfoVersion={#AppVersion}
 DefaultDirName={autopf}\nanoAudio
 DefaultGroupName=nanoAudio ASIO
 ArchitecturesAllowed=x64compatible
@@ -25,6 +34,8 @@ OutputDir=Output
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+; Em instalações manuais o Inno oferece fechar programas que usam o driver.
+; O atualizador automático sempre passa /NOCLOSEAPPLICATIONS (nunca fecha a DAW).
 CloseApplications=yes
 RestartApplications=no
 DisableProgramGroupPage=yes
@@ -35,6 +46,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+; A tarefa agendada roda como SYSTEM, por isso só existe em instalação de administrador
+; (o executável fica em Program Files, onde usuários comuns não podem gravar).
+Name: "autoupdate"; Description: "Atualizar automaticamente (consulta o GitHub ao iniciar o Windows e uma vez por dia)"; GroupDescription: "Atualizações:"; Check: IsAdminInstallMode
 
 [InstallDelete]
 ; Remove automaticamente quaisquer arquivos com o nome antigo de versões anteriores
@@ -52,15 +66,31 @@ Source: "nanoAudioDriver32.dll"; DestDir: "{app}"; Flags: ignoreversion regserve
 ; Aplicativo Executável do Painel de Controle
 Source: "nanoAudioControlPanel.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+; Atualizador automático + script que registra a tarefa agendada
+Source: "nanoAudioUpdater.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+Source: "nanoAudioUpdateTask.ps1"; DestDir: "{app}"; Flags: ignoreversion
+
 ; Documentação e Guia
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Painel de Controle nanoAudio"; Filename: "{app}\nanoAudioControlPanel.exe"
+Name: "{group}\Verificar atualizações do nanoAudio"; Filename: "{app}\nanoAudioUpdater.exe"; Parameters: "--interactive"
 Name: "{group}\README - Guia de Uso"; Filename: "{app}\README.md"
 Name: "{group}\{cm:UninstallProgram,{#AppName}}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Painel de Controle nanoAudio"; Filename: "{app}\nanoAudioControlPanel.exe"; Tasks: desktopicon
 
 [Run]
+; Registra (ou remove) a tarefa agendada do atualizador conforme a opção escolhida.
+; Roda também em instalações silenciosas, inclusive as feitas pelo próprio atualizador.
+Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\nanoAudioUpdateTask.ps1"" -Action Register -UpdaterPath ""{app}\nanoAudioUpdater.exe"""; Flags: runhidden waituntilterminated; StatusMsg: "Configurando atualizações automáticas..."; Tasks: autoupdate; Check: IsAdminInstallMode
+Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\nanoAudioUpdateTask.ps1"" -Action Unregister"; Flags: runhidden waituntilterminated; Tasks: not autoupdate; Check: IsAdminInstallMode
+
 ; Executar o Painel de Controle ao final da instalação
-Description: "Abrir o Painel de Controle nanoAudio agora"; Flags: nowait postinstall skipifsilent; Filename: "{app}\nanoAudioControlPanel.exe"
+Filename: "{app}\nanoAudioControlPanel.exe"; Description: "Abrir o Painel de Controle nanoAudio agora"; Flags: nowait postinstall skipifsilent
+
+[UninstallRun]
+Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\nanoAudioUpdateTask.ps1"" -Action Unregister"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveUpdateTask"
+
+[UninstallDelete]
+Type: filesandordirs; Name: "{app}\Updates"
