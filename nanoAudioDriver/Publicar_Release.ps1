@@ -108,9 +108,15 @@ Write-Host $manifestText
 
 # --------------------------------------------------------------------------
 Step "Commit, tag $tag e push"
-Invoke-Native git @('add', '--', 'nanoAudioVersion.h', 'nanoAudioDriver.dll', 'nanoAudioDriver32.dll',
-                    'nanoAudioControlPanel.exe', 'nanoAudioUpdater.exe')
-if (-not (Test-Native git @('diff', '--cached', '--quiet'))) { Invoke-Native git @('commit', '-m', "release: $tag") }
+$releaseFiles = @('nanoAudioVersion.h', 'nanoAudioDriver.dll', 'nanoAudioDriver32.dll',
+                  'nanoAudioControlPanel.exe', 'nanoAudioUpdater.exe')
+Invoke-Native git (@('add', '--') + $releaseFiles)
+if (Get-NativeOutput git @('diff', '--cached', '--name-only')) {
+    Invoke-Native git @('commit', '-m', "release: $tag")
+}
+# A tag precisa apontar para os mesmos binários que vão no instalador.
+$pending = Get-NativeOutput git (@('status', '--porcelain', '--') + $releaseFiles)
+if ($pending) { Fail "Os arquivos compilados não ficaram commitados (nada foi publicado):`n$pending" }
 Invoke-Native git @('tag', '-a', $tag, '-m', "nanoAudio $Version")
 Invoke-Native git @('push', 'origin', $branch)
 Invoke-Native git @('push', 'origin', $tag)
