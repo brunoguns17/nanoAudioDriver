@@ -111,6 +111,9 @@ Step "Commit, tag $tag e push"
 $releaseFiles = @('nanoAudioVersion.h', 'nanoAudioDriver.dll', 'nanoAudioDriver32.dll',
                   'nanoAudioControlPanel.exe', 'nanoAudioUpdater.exe')
 Invoke-Native git (@('add', '--') + $releaseFiles)
+# Não use "git diff --cached --quiet" aqui: com "*.exe/*.dll binary" no
+# .gitattributes ele responde "sem diferenças" mesmo com binários staged
+# (foi o que fez a v2.6.0 ser publicada sem o commit de release).
 if (Get-NativeOutput git @('diff', '--cached', '--name-only')) {
     Invoke-Native git @('commit', '-m', "release: $tag")
 }
