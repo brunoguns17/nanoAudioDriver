@@ -552,15 +552,9 @@ int RunUpdate(const Options& opt) {
     }
     Log(L"SHA-256 conferido: " + Widen(actualHash));
 
-    if (opt.dryRun) {
-        CloseHandle(hSetup);
-        Log(L"Dry-run: instalador verificado em " + localPath + L" (não executado).");
-        Message(opt, L"[dry-run] Versão " + newVer + L" baixada e verificada em:\n" + localPath, MB_ICONINFORMATION | MB_OK);
-        return kUpdateStarted;
-    }
-
     // 5. O driver não pode estar em uso (DAW aberta) nem o painel aberto.
-    if (!opt.silent) ClosePanelWindows();
+    //    (Em --dry-run a checagem também roda, mas nada é fechado.)
+    if (!opt.silent && !opt.dryRun) ClosePanelWindows();
     const std::wstring dir = ExeDir();
     const std::vector<std::wstring> watched = {
         dir + L"\\nanoAudioDriver.dll",
@@ -581,6 +575,13 @@ int RunUpdate(const Options& opt) {
         int answer = Message(opt, L"O nanoAudio está em uso por:\n\n" + list +
                                   L"\nFeche esses programas e clique em Tentar novamente.", MB_ICONWARNING | MB_RETRYCANCEL);
         if (answer != IDRETRY) { CloseHandle(hSetup); return kDeclined; }
+    }
+
+    if (opt.dryRun) {
+        CloseHandle(hSetup);
+        Log(L"Dry-run: instalador verificado em " + localPath + L" e driver livre (não executado).");
+        Message(opt, L"[dry-run] Versão " + newVer + L" baixada e verificada em:\n" + localPath, MB_ICONINFORMATION | MB_OK);
+        return kUpdateStarted;
     }
 
     // 6. Executa o instalador. /NOCLOSEAPPLICATIONS garante que o Inno Setup
