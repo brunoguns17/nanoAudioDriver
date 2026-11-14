@@ -8,7 +8,7 @@
 
 #pragma once
 
-#define NANOAUDIO_VERSION_STR "2.6.1"
+#define NANOAUDIO_VERSION_STR "2.6.2"
 
 // Repositório público de onde o atualizador baixa as releases.
 #define NANOAUDIO_GITHUB_REPO "brunoguns17/nanoAudioDriver"
