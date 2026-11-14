@@ -46,9 +46,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-; A tarefa agendada roda como SYSTEM, por isso só existe em instalação de administrador
-; (o executável fica em Program Files, onde usuários comuns não podem gravar).
-Name: "autoupdate"; Description: "Atualizar automaticamente (consulta o GitHub ao iniciar o Windows e uma vez por dia)"; GroupDescription: "Atualizações:"; Check: IsAdminInstallMode
+; A tarefa agendada roda como SYSTEM e só VERIFICA (nunca instala): grava a versão nova em
+; {commonappdata}\nanoAudio\update-available.txt, que o painel lê ao abrir. Só existe em
+; instalação de administrador (o executável fica em Program Files).
+; O nome "autoupdate" é mantido para o Inno lembrar a escolha feita em versões anteriores.
+Name: "autoupdate"; Description: "Avisar quando houver atualizações (consulta o GitHub ao iniciar o Windows e uma vez por dia; o aviso aparece ao abrir o Painel de Controle)"; GroupDescription: "Atualizações:"; Check: IsAdminInstallMode
 
 [InstallDelete]
 ; Remove automaticamente quaisquer arquivos com o nome antigo de versões anteriores
@@ -66,7 +68,7 @@ Source: "nanoAudioDriver32.dll"; DestDir: "{app}"; Flags: ignoreversion regserve
 ; Aplicativo Executável do Painel de Controle
 Source: "nanoAudioControlPanel.exe"; DestDir: "{app}"; Flags: ignoreversion
 
-; Atualizador automático + script que registra a tarefa agendada
+; Atualizador + script que registra a tarefa agendada de verificação
 Source: "nanoAudioUpdater.exe"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 Source: "nanoAudioUpdateTask.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -83,7 +85,7 @@ Name: "{autodesktop}\Painel de Controle nanoAudio"; Filename: "{app}\nanoAudioCo
 [Run]
 ; Registra (ou remove) a tarefa agendada do atualizador conforme a opção escolhida.
 ; Roda também em instalações silenciosas, inclusive as feitas pelo próprio atualizador.
-Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\nanoAudioUpdateTask.ps1"" -Action Register -UpdaterPath ""{app}\nanoAudioUpdater.exe"""; Flags: runhidden waituntilterminated; StatusMsg: "Configurando atualizações automáticas..."; Tasks: autoupdate; Check: IsAdminInstallMode
+Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\nanoAudioUpdateTask.ps1"" -Action Register -UpdaterPath ""{app}\nanoAudioUpdater.exe"""; Flags: runhidden waituntilterminated; StatusMsg: "Configurando a verificação de atualizações..."; Tasks: autoupdate; Check: IsAdminInstallMode
 Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\nanoAudioUpdateTask.ps1"" -Action Unregister"; Flags: runhidden waituntilterminated; Tasks: not autoupdate; Check: IsAdminInstallMode
 
 ; Executar o Painel de Controle ao final da instalação
@@ -94,3 +96,4 @@ Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -F
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\Updates"
+Type: filesandordirs; Name: "{commonappdata}\nanoAudio"

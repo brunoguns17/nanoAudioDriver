@@ -1,26 +1,26 @@
 // ============================================================================
 // nanoAudioUpdater.cpp
-// Atualizador automático do nanoAudio (executável separado, nunca roda dentro
-// da DAW).
+// Atualizador do nanoAudio (executável separado, nunca roda dentro da DAW).
 //
-// Fluxo:
-//   1. Baixa  https://github.com/<repo>/releases/latest/download/update-manifest.txt
-//      (o GitHub redireciona "latest" para a release publicada mais recente).
-//   2. Compara a versão do manifesto com a versão compilada neste executável.
-//   3. Se for mais nova: baixa o instalador da release, confere o SHA-256,
-//      verifica se nenhum programa (DAW, painel) está usando o driver e executa
-//      o instalador do Inno Setup em modo silencioso.
+// Consulta https://github.com/<repo>/releases/latest/download/update-manifest.txt
+// (o GitHub redireciona "latest" para a release publicada mais recente) e
+// compara a versão com a compilada neste executável.
 //
 // Modos:
-//   --silent       Tarefa agendada (SYSTEM). Sem nenhuma janela; registra em
-//                  %ProgramData%\nanoAudio\update.log. Se o driver estiver em
-//                  uso, adia para a próxima execução.
-//   --interactive  (padrão) Aberto pelo painel: pergunta antes de instalar.
-//   --dry-run      Faz tudo (consulta, download, hash) mas não instala.
+//   --silent       Verificação em segundo plano (tarefa agendada). NÃO instala:
+//                  só grava a versão nova em %ProgramData%\nanoAudio\
+//                  update-available.txt. O painel de controle lê esse arquivo
+//                  ao abrir e mostra a tela "Atualização disponível".
+//   --interactive  (padrão) Aberto pelo painel/Menu Iniciar: pergunta, baixa o
+//                  instalador, confere o SHA-256, pede para fechar programas
+//                  que usam o driver e executa o instalador (com UAC).
+//   --yes          Com --interactive: não pergunta de novo (o usuário já
+//                  confirmou na tela do painel).
+//   --dry-run      Não instala nem grava estado; sem janelas (só log).
 //   --log <arq>    Caminho alternativo para o log.
 //
-// Códigos de saída: 0 = já atualizado, 1 = erro, 2 = atualização iniciada
-// (ou disponível, em --dry-run), 3 = adiada (driver em uso), 4 = recusada.
+// Códigos de saída: 0 = já atualizado, 1 = erro, 2 = atualização disponível
+// (--silent) ou instalador iniciado, 3 = driver em uso, 4 = recusada.
 // ============================================================================
 
 #ifndef UNICODE
@@ -44,6 +44,7 @@
 #include <cwchar>
 
 #include "nanoAudioVersion.h"
+#include "nanoAudioUpdateState.h"
 
 #ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
 #define WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 4
@@ -63,6 +64,10 @@
 namespace {
 
 enum ExitCode { kUpToDate = 0, kError = 1, kUpdateStarted = 2, kBusy = 3, kDeclined = 4 };
+const int kUpdateAvailable = kUpdateStarted;
+
+using nanoAudioUpdate::ParseVersion;
+using nanoAudioUpdate::CompareVersions;
 
 const wchar_t* kTitle           = L"nanoAudio — Atualização";
 const wchar_t* kPanelClassName  = L"UniversalWasapiAsioPanelClass";
@@ -72,6 +77,7 @@ const size_t   kMaxInstallerSize = 200u * 1024u * 1024u;
 struct Options {
     bool         silent  = false;
     bool         dryRun  = false;
+    bool         yes     = false;
     std::wstring logPath;
 };
 
@@ -162,31 +168,6 @@ std::wstring Win32Error(DWORD code) {
 // ---------------------------------------------------------------------------
 // Versões e manifesto
 // ---------------------------------------------------------------------------
-
-bool ParseVersion(const std::string& s, long out[3]) {
-    int part = 0;
-    size_t digits = 0;
-    out[0] = out[1] = out[2] = 0;
-    for (char c : s) {
-        if (c >= '0' && c <= '9') {
-            if (++digits > 5) return false;
-            out[part] = out[part] * 10 + (c - '0');
-        } else if (c == '.' && digits > 0 && part < 2) {
-            ++part;
-            digits = 0;
-        } else {
-            return false;
-        }
-    }
-    return part == 2 && digits > 0;
-}
-
-int CompareVersions(const long a[3], const long b[3]) {
-    for (int i = 0; i < 3; ++i) {
-        if (a[i] != b[i]) return (a[i] < b[i]) ? -1 : 1;
-    }
-    return 0;
-}
 
 struct Manifest {
     std::string version;
@@ -435,7 +416,7 @@ void ClosePanelWindows() {
 }
 
 int Message(const Options& opt, const std::wstring& text, UINT flags) {
-    if (opt.silent) return 0;
+    if (opt.silent || opt.dryRun) return 0;
     return MessageBoxW(nullptr, text.c_str(), kTitle, flags | MB_SETFOREGROUND | MB_TOPMOST);
 }
 
@@ -474,12 +455,26 @@ int RunUpdate(const Options& opt) {
     const std::wstring newVer = Widen(m.version);
     if (CompareVersions(vNew, vCur) <= 0) {
         Log(L"Nenhuma atualização: versão publicada " + newVer);
+        if (!opt.dryRun) nanoAudioUpdate::ClearPendingUpdate();   // pode falhar sem admin; o painel compara versões
         Message(opt, L"Você já está usando a versão mais recente do nanoAudio (" + current + L").", MB_ICONINFORMATION | MB_OK);
         return kUpToDate;
     }
     Log(L"Nova versão disponível: " + newVer);
 
-    if (!opt.silent) {
+    // Verificação em segundo plano: só registra; o aviso aparece ao abrir o painel.
+    if (opt.silent) {
+        if (opt.dryRun) {
+            Log(L"Dry-run: aviso não gravado.");
+        } else if (nanoAudioUpdate::WritePendingUpdate(m.version)) {
+            Log(L"Aviso gravado em " + nanoAudioUpdate::StateFilePath());
+        } else {
+            Log(L"Falha ao gravar o aviso: " + Win32Error(GetLastError()));
+            return kError;
+        }
+        return kUpdateAvailable;
+    }
+
+    if (!opt.yes) {
         int answer = Message(opt,
             L"Uma nova versão do nanoAudio está disponível.\n\n"
             L"Versão instalada:  " + current + L"\n"
@@ -489,17 +484,10 @@ int RunUpdate(const Options& opt) {
         if (answer != IDYES) { Log(L"Usuário recusou a atualização."); return kDeclined; }
     }
 
-    // 2. Pasta de download: no modo silencioso fica ao lado do atualizador
-    //    (Program Files, gravável só por administradores); no interativo, no
-    //    perfil do próprio usuário.
-    std::wstring dlDir;
-    if (opt.silent) {
-        dlDir = ExeDir() + L"\\Updates";
-    } else {
-        std::wstring base = EnvPath(L"LOCALAPPDATA") + L"\\nanoAudio";
-        EnsureDir(base);
-        dlDir = base + L"\\Updates";
-    }
+    // 2. Pasta de download no perfil do próprio usuário.
+    const std::wstring dlBase = EnvPath(L"LOCALAPPDATA") + L"\\nanoAudio";
+    EnsureDir(dlBase);
+    const std::wstring dlDir = dlBase + L"\\Updates";
     if (!EnsureDir(dlDir)) {
         err = Win32Error(GetLastError());
         Log(L"Não foi possível criar a pasta de download " + dlDir + L": " + err);
@@ -554,7 +542,7 @@ int RunUpdate(const Options& opt) {
 
     // 5. O driver não pode estar em uso (DAW aberta) nem o painel aberto.
     //    (Em --dry-run a checagem também roda, mas nada é fechado.)
-    if (!opt.silent && !opt.dryRun) ClosePanelWindows();
+    if (!opt.dryRun) ClosePanelWindows();
     const std::wstring dir = ExeDir();
     const std::vector<std::wstring> watched = {
         dir + L"\\nanoAudioDriver.dll",
@@ -567,9 +555,9 @@ int RunUpdate(const Options& opt) {
         std::wstring list;
         for (const auto& n : busy) list += L"   •  " + n + L"\n";
         Log(L"Driver em uso por: " + list);
-        if (opt.silent) {
+        if (opt.dryRun) {
             CloseHandle(hSetup);
-            Log(L"Atualização adiada para a próxima verificação.");
+            Log(L"Dry-run: instalação seria bloqueada até o driver ser liberado.");
             return kBusy;
         }
         int answer = Message(opt, L"O nanoAudio está em uso por:\n\n" + list +
@@ -586,36 +574,19 @@ int RunUpdate(const Options& opt) {
 
     // 6. Executa o instalador. /NOCLOSEAPPLICATIONS garante que o Inno Setup
     //    nunca feche a DAW do usuário.
-    std::wstring setupLog = (opt.silent ? EnvPath(L"ProgramData") : EnvPath(L"LOCALAPPDATA")) + L"\\nanoAudio\\install.log";
-    std::wstring args = L"/SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /SP- /LOG=\"" + setupLog + L"\"";
-    bool started = false;
-    DWORD launchError = 0;
-    if (opt.silent) {
-        std::wstring cmd = L"\"" + localPath + L"\" /VERYSILENT " + args;
-        STARTUPINFOW si = { sizeof(si) };
-        PROCESS_INFORMATION pi = {};
-        // Sai do job da tarefa agendada, para o instalador sobreviver ao fim deste processo.
-        started = CreateProcessW(localPath.c_str(), &cmd[0], nullptr, nullptr, FALSE,
-                                 CREATE_BREAKAWAY_FROM_JOB, nullptr, dlDir.c_str(), &si, &pi) != FALSE;
-        if (!started) {
-            started = CreateProcessW(localPath.c_str(), &cmd[0], nullptr, nullptr, FALSE,
-                                     0, nullptr, dlDir.c_str(), &si, &pi) != FALSE;
-        }
-        if (started) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
-        else launchError = GetLastError();
-    } else {
-        std::wstring params = L"/SILENT " + args;
-        SHELLEXECUTEINFOW sei = { sizeof(sei) };
-        sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
-        sei.lpVerb       = L"runas";
-        sei.lpFile       = localPath.c_str();
-        sei.lpParameters = params.c_str();
-        sei.lpDirectory  = dlDir.c_str();
-        sei.nShow        = SW_SHOWNORMAL;
-        started = ShellExecuteExW(&sei) != FALSE;
-        if (started) { if (sei.hProcess) CloseHandle(sei.hProcess); }
-        else launchError = GetLastError();
-    }
+    const std::wstring setupLog = dlBase + L"\\install.log";
+    const std::wstring params = L"/SILENT /SUPPRESSMSGBOXES /NORESTART /NOCLOSEAPPLICATIONS /SP- /LOG=\"" + setupLog + L"\"";
+    SHELLEXECUTEINFOW sei = {};
+    sei.cbSize       = sizeof(sei);
+    sei.fMask        = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    sei.lpVerb       = L"runas";
+    sei.lpFile       = localPath.c_str();
+    sei.lpParameters = params.c_str();
+    sei.lpDirectory  = dlDir.c_str();
+    sei.nShow        = SW_SHOWNORMAL;
+    const bool started = ShellExecuteExW(&sei) != FALSE;
+    const DWORD launchError = started ? 0 : GetLastError();
+    if (started && sei.hProcess) CloseHandle(sei.hProcess);
     CloseHandle(hSetup);
 
     if (!started) {
@@ -640,6 +611,7 @@ Options ParseArgs() {
         if (a == L"--silent")                     opt.silent = true;
         else if (a == L"--interactive")           opt.silent = false;
         else if (a == L"--dry-run")               opt.dryRun = true;
+        else if (a == L"--yes")                   opt.yes = true;
         else if (a == L"--log" && i + 1 < argc)   opt.logPath = argv[++i];
     }
     if (argv) LocalFree(argv);

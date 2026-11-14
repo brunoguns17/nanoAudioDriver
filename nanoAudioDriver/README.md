@@ -20,7 +20,7 @@ Driver ASIO universal em C++ (COM In-Process Server 64-bit/32-bit) projetado par
 
 * `nanoAudioConfig.cpp` / `nanoAudioConfigMain.cpp`: Painel de controle gráfico (usado pela DLL dentro da DAW e pelo `nanoAudioControlPanel.exe`).
 
-* `nanoAudioUpdater.cpp`: Atualizador automático (`nanoAudioUpdater.exe`), que consulta as releases do GitHub.
+* `nanoAudioUpdater.cpp` / `nanoAudioUpdateState.h`: Atualizador (`nanoAudioUpdater.exe`), que consulta as releases do GitHub, e o estado "atualização disponível" lido pelo painel.
 
 * `nanoAudioVersion.h`: Fonte única da versão e do repositório do GitHub usado pelo atualizador.
 
@@ -60,7 +60,7 @@ O instalador:
 * Instala os drivers nativos **64-bit** e **32-bit** em `C:\Program Files\nanoAudio`.
 * Registra automaticamente o servidor COM e as entradas ASIO para todas as DAWs (64-bit e 32-bit).
 * Adiciona a opção de desinstalação padrão no menu "Configurações > Aplicativos > Aplicativos Instalados" (ou Painel de Controle) do Windows.
-* Instala o atualizador automático (opção **"Atualizar automaticamente"**, marcada por padrão). Veja [Atualizações Automáticas](#atualizações-automáticas).
+* Instala o aviso de atualizações (opção **"Avisar quando houver atualizações"**, marcada por padrão). Veja [Aviso de Atualizações](#aviso-de-atualizações).
 
 ---
 
@@ -89,7 +89,7 @@ Se preferir instalar diretamente a partir dos arquivos locais:
 * Execute como Administrador: **`Instalar_e_Compilar_Driver.bat`**
 * Para remover: **`Desinstalar_Driver.bat`**
 
-Esse modo não instala o atualizador automático.
+Esse modo não instala o aviso de atualizações.
 
 ---
 
@@ -123,21 +123,24 @@ O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo W
 
 ---
 
-## Atualizações Automáticas
+## Aviso de Atualizações
 
-A partir da versão 2.6.0, o instalador oficial inclui o `nanoAudioUpdater.exe` e cria a tarefa agendada **`\nanoAudio\Atualizador automatico`**. Ela roda ao iniciar o Windows (depois de 5 minutos) e diariamente às 12:00 (ou assim que possível, se o PC estiver desligado nesse horário). A cada execução, o atualizador:
+O instalador oficial inclui o `nanoAudioUpdater.exe` e cria a tarefa agendada **`\nanoAudio\Atualizador automatico`**. Ela roda ao iniciar o Windows (depois de 5 minutos) e diariamente às 12:00 (ou assim que possível, se o PC estiver desligado nesse horário).
 
-1. Consulta `https://github.com/brunoguns17/nanoAudioDriver/releases/latest/download/update-manifest.txt` (somente HTTPS; nenhum dado pessoal é enviado).
-2. Se houver versão mais nova, baixa o instalador da release e confere o SHA-256 informado no manifesto.
-3. **Só instala se nenhum programa estiver usando o driver** (DAW ou painel abertos). Caso contrário, tenta de novo na próxima execução. O atualizador nunca fecha a sua DAW.
-4. Executa o instalador em modo silencioso.
+**A verificação não instala nada.** Ela consulta `https://github.com/brunoguns17/nanoAudioDriver/releases/latest/download/update-manifest.txt` (somente HTTPS; nenhum dado pessoal é enviado) e, se houver versão mais nova, apenas registra isso em `C:\ProgramData\nanoAudio\update-available.txt`.
 
-Também dá para verificar manualmente pelo botão **Verificar atualizações** no Painel de Controle ou pelo atalho no Menu Iniciar.
+Na próxima vez que o usuário abrir o **Painel de Controle** (pelo Menu Iniciar ou de dentro da DAW), aparece a tela **"Atualização disponível"**, com as opções:
+* **Atualizar agora:** baixa o instalador, confere o SHA-256 informado no manifesto e instala (o Windows pede permissão de administrador). Se uma DAW estiver usando o driver, o atualizador mostra quais programas fechar; ele nunca fecha a DAW sozinho.
+* **Mais tarde:** fecha o aviso, que volta a aparecer na próxima vez que o painel for aberto.
+* **Ver novidades:** abre a página da release no GitHub.
 
-* **Desativar:** reinstale e desmarque **"Atualizar automaticamente"**, ou desative a tarefa no Agendador de Tarefas do Windows.
-* **Logs:** `C:\ProgramData\nanoAudio\update.log` (verificação automática) e `%LOCALAPPDATA%\nanoAudio\update.log` (verificação manual).
-* **Versões anteriores à 2.6.0** não têm o atualizador: instale a 2.6.0 manualmente uma vez. Daí em diante, as atualizações chegam sozinhas.
-* **Segurança:** o atualizador instala, com privilégios de administrador, o que for publicado nas releases deste repositório. Proteja a conta do GitHub com autenticação em dois fatores.
+O painel só lê esse arquivo local: nenhum acesso à internet acontece dentro da DAW. Também dá para verificar na hora pelo botão **Verificar atualizações** no painel ou pelo atalho no Menu Iniciar.
+
+* **Desativar:** reinstale e desmarque **"Avisar quando houver atualizações"**, ou desative a tarefa no Agendador de Tarefas do Windows.
+* **Logs:** `C:\ProgramData\nanoAudio\update.log` (verificação em segundo plano) e `%LOCALAPPDATA%\nanoAudio\update.log` (verificação/instalação pelo usuário).
+* **Versões anteriores à 2.6.0** não têm o atualizador: instale uma versão nova manualmente uma vez.
+* **A versão 2.6.0** ainda instalava as atualizações sozinha, em segundo plano. Por isso, quem tem a 2.6.0 recebe a 2.6.1 automaticamente; dali em diante passa a valer o aviso no painel.
+* **Segurança:** ao clicar em "Atualizar agora", o atualizador instala com privilégios de administrador o que for publicado nas releases deste repositório. Proteja a conta do GitHub com autenticação em dois fatores.
 
 ---
 

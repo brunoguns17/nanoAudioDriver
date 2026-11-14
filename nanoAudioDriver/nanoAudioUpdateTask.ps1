@@ -1,14 +1,15 @@
 ﻿# ============================================================================
 # nanoAudioUpdateTask.ps1
-# Registra / remove a tarefa agendada do atualizador automático do nanoAudio.
+# Registra / remove a tarefa agendada que verifica atualizações do nanoAudio.
 # Chamado pelo instalador (Inno Setup) com privilégios de administrador.
 #
 #   -Action Register   -UpdaterPath "C:\Program Files\nanoAudio\nanoAudioUpdater.exe"
 #   -Action Unregister
 #
-# A tarefa roda como SYSTEM (o instalador precisa de admin para registrar o
-# driver) ao iniciar o Windows (+5 min) e diariamente às 12:00. Se o PC estiver
-# desligado no horário, roda assim que possível; também roda na bateria.
+# A tarefa roda como SYSTEM ao iniciar o Windows (+5 min) e diariamente às 12:00
+# (se o PC estiver desligado no horário, roda assim que possível). Ela só
+# verifica e grava %ProgramData%\nanoAudio\update-available.txt; quem decide
+# instalar é o usuário, na tela de aviso que aparece ao abrir o Painel de Controle.
 # ============================================================================
 
 param(
@@ -57,7 +58,7 @@ if ($CurrentUserForTesting) {
 
 Register-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName `
     -Action $taskAction -Trigger $triggers -Settings $settings -Principal $principal `
-    -Description 'Verifica no GitHub se há uma nova versão do nanoAudio e a instala em segundo plano (somente quando nenhuma DAW está usando o driver).' `
+    -Description 'Verifica no GitHub se há uma nova versão do nanoAudio. Não instala nada: o aviso aparece quando o Painel de Controle for aberto.' `
     -Force | Out-Null
 
 exit 0

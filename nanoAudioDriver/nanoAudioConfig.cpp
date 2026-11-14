@@ -6,6 +6,7 @@
 
 #include "nanoAudioConfig.h"
 #include "nanoAudioVersion.h"
+#include "nanoAudioUpdateState.h"
 #include <commctrl.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstdio>
@@ -446,7 +447,7 @@ static void PaintBackground(HWND hWnd, HDC hdc, const DialogState* st) {
 }
 
 // Abre o nanoAudioUpdater.exe que fica na mesma pasta deste módulo.
-static void LaunchUpdater(HWND hWnd) {
+static void LaunchUpdater(HWND hWnd, const wchar_t* args) {
     HMODULE hMod = nullptr;
     GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
                        reinterpret_cast<LPCWSTR>(&LaunchUpdater), &hMod);
@@ -464,7 +465,7 @@ static void LaunchUpdater(HWND hWnd) {
         return;
     }
 
-    std::wstring cmd = L"\"" + exe + L"\" --interactive";
+    std::wstring cmd = L"\"" + exe + L"\" " + args;
     STARTUPINFOW si = {};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
@@ -683,10 +684,25 @@ static void PopulatePanelControls(HWND hWnd, DialogState* st) {
     UpdateLatencyDisplay(hWnd, st);
 }
 
+// Mensagem postada no fim do WM_CREATE: com o painel já visível, mostra o aviso
+// de atualização se a verificação em segundo plano encontrou uma versão nova.
+static const UINT kMsgCheckPendingUpdate = WM_APP + 1;
+
+static bool ShowUpdateNotice(HWND hPanel, const DialogState* st, const std::string& newVersion);
+
 static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     DialogState* pState = reinterpret_cast<DialogState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
 
     switch (uMsg) {
+    case kMsgCheckPendingUpdate: {
+        // Só lê um arquivo local: nenhum acesso à rede acontece dentro da DAW.
+        const std::string pending = nanoAudioUpdate::ReadPendingUpdate(NANOAUDIO_VERSION_STR);
+        if (!pending.empty() && ShowUpdateNotice(hWnd, pState, pending)) {
+            LaunchUpdater(hWnd, L"--interactive --yes");
+        }
+        return 0;
+    }
+
     case WM_NCCREATE: {
         CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
         pState = reinterpret_cast<DialogState*>(cs->lpCreateParams);
@@ -706,6 +722,7 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
         CreatePanelControls(hWnd, pState);
         PopulatePanelControls(hWnd, pState);
+        PostMessageW(hWnd, kMsgCheckPendingUpdate, 0, 0);
         return 0;
     }
 
@@ -827,7 +844,7 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         }
 
         if (id == IDC_BTN_UPDATES && code == BN_CLICKED) {
-            LaunchUpdater(hWnd);
+            LaunchUpdater(hWnd, L"--interactive");
             return 0;
         }
 
@@ -904,6 +921,254 @@ static void DeactivateVisualStyles(HANDLE hCtx, ULONG_PTR cookie) {
     if (hCtx == INVALID_HANDLE_VALUE) return;
     DeactivateActCtx(0, cookie);
     ReleaseActCtx(hCtx);
+}
+
+// ============================================================================
+// TELA "ATUALIZAÇÃO DISPONÍVEL" (aparece ao abrir o painel)
+// ============================================================================
+//
+//   +----------------------------------------------+
+//   | Atualização disponível               v2.6.1  |  <- cabeçalho escuro
+//   | nanoAudio ASIO Driver                         |
+//   +----------------------------------------------+
+//   | Uma nova versão do nanoAudio está disponível. |
+//   | Versão instalada   2.6.0                      |
+//   | Nova versão        2.6.1                      |
+//   | (dica)                                        |
+//   +----------------------------------------------+
+//   | [Ver novidades]   [Mais tarde] [Atualizar agora] |
+//   +----------------------------------------------+
+
+namespace NoticeLayout {
+    constexpr int ClientW   = 460;
+    constexpr int HeaderH   = 64;
+    constexpr int Margin    = 20;
+    constexpr int FooterTop = 214;
+    constexpr int FooterH   = 56;
+    constexpr int ClientH   = FooterTop + FooterH;   // 270
+}
+
+enum NoticeControlIDs {
+    IDC_N_UPDATE = 400,
+    IDC_N_LATER,
+    IDC_N_NOTES,
+    IDC_N_TEXT,
+    IDC_N_LBL_CUR,
+    IDC_N_CUR,
+    IDC_N_LBL_NEW,
+    IDC_N_NEW,
+    IDC_N_HINT
+};
+
+struct NoticeState {
+    const DialogState* panel = nullptr;   // fontes, pincéis e DPI do painel
+    std::wstring       newVersion;
+    bool               accepted = false;
+    bool               isOpen   = true;
+};
+
+static void OpenReleasePage(const std::wstring& version) {
+    // shell32 é carregado sob demanda para não adicionar dependências de link à DLL.
+    typedef HINSTANCE (WINAPI *ShellExecuteWFn)(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT);
+    HMODULE hShell = LoadLibraryW(L"shell32.dll");
+    if (!hShell) return;
+    auto fn = reinterpret_cast<ShellExecuteWFn>(reinterpret_cast<void*>(GetProcAddress(hShell, "ShellExecuteW")));
+    const std::wstring url = std::wstring(L"https://github.com/") + NANOAUDIO_WIDEN(NANOAUDIO_GITHUB_REPO) +
+                             L"/releases/tag/v" + version;
+    if (fn) fn(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+static void PaintNotice(HWND hWnd, HDC hdc, const NoticeState* ns) {
+    const DialogState* st = ns->panel;
+    RECT rc;
+    GetClientRect(hWnd, &rc);
+    const int headerH   = st->S(NoticeLayout::HeaderH);
+    const int footerTop = st->S(NoticeLayout::FooterTop);
+
+    FillRectColor(hdc, RECT{ 0, 0, rc.right, headerH }, Palette::HeaderBg);
+    FillRectColor(hdc, RECT{ 0, headerH, rc.right, footerTop }, Palette::BodyBg);
+    FillRectColor(hdc, RECT{ 0, footerTop, rc.right, rc.bottom }, Palette::FooterBg);
+    FillRectColor(hdc, RECT{ 0, footerTop, rc.right, footerTop + (std::max)(1, st->S(1)) }, Palette::FooterLine);
+
+    const int saved = SaveDC(hdc);
+    SetBkMode(hdc, TRANSPARENT);
+    const UINT fmtL = DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_BOTTOM;
+    const UINT fmtR = DT_RIGHT | DT_SINGLELINE | DT_NOPREFIX | DT_BOTTOM;
+    const int left  = st->S(NoticeLayout::Margin);
+    const int right = rc.right - st->S(NoticeLayout::Margin);
+
+    RECT rTitle = { left, st->S(8), right, st->S(38) };
+    SelectObject(hdc, st->hFontTitle);
+    SetTextColor(hdc, Palette::HeaderText);
+    DrawTextW(hdc, L"Atualização disponível", -1, &rTitle, fmtL);
+
+    RECT rSub = { left, st->S(40), right, st->S(58) };
+    SelectObject(hdc, st->hFontSmall);
+    SetTextColor(hdc, Palette::HeaderSub);
+    DrawTextW(hdc, L"nanoAudio ASIO Driver", -1, &rSub, fmtL);
+
+    const std::wstring tag = L"v" + ns->newVersion;
+    RECT rTag = { left, st->S(8), right, st->S(40) };
+    SelectObject(hdc, st->hFontReadout);
+    SetTextColor(hdc, Palette::LatGood);
+    DrawTextW(hdc, tag.c_str(), -1, &rTag, fmtR);
+
+    RestoreDC(hdc, saved);
+}
+
+static LRESULT CALLBACK NoticeWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    NoticeState* ns = reinterpret_cast<NoticeState*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+
+    switch (uMsg) {
+    case WM_NCCREATE: {
+        CREATESTRUCTW* cs = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        ns = reinterpret_cast<NoticeState*>(cs->lpCreateParams);
+        SetWindowLongPtrW(hWnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(ns));
+        return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+    }
+
+    case WM_CREATE: {
+        using namespace NoticeLayout;
+        const DialogState* st = ns->panel;
+        const int w = ClientW - 2 * Margin;
+        AddLabel(hWnd, st, L"Uma nova versão do nanoAudio está disponível.", Margin, 82, w, IDC_N_TEXT, st->hFontBold);
+
+        AddLabel(hWnd, st, L"Versão instalada", Margin, 112, 130, IDC_N_LBL_CUR);
+        AddLabel(hWnd, st, NANOAUDIO_VERSION_WSTR, Margin + 130, 112, 120, IDC_N_CUR);
+        AddLabel(hWnd, st, L"Nova versão", Margin, 134, 130, IDC_N_LBL_NEW);
+        AddLabel(hWnd, st, ns->newVersion.c_str(), Margin + 130, 134, 120, IDC_N_NEW, st->hFontBold);
+
+        const wchar_t* hint = st->inDawMode
+            ? L"Para instalar, a DAW precisa ser fechada: o atualizador avisa quando for a hora. "
+              L"Suas configurações de áudio são mantidas."
+            : L"A instalação leva menos de um minuto e mantém suas configurações de áudio.";
+        AddControl(hWnd, st, L"STATIC", hint, SS_LEFT | SS_NOPREFIX, Margin, 166, w, 34, IDC_N_HINT, st->hFontSmall);
+
+        const int by = FooterTop + (FooterH - 30) / 2;
+        AddControl(hWnd, st, L"BUTTON", L"Ver novidades", BS_PUSHBUTTON | WS_TABSTOP,
+                   Margin, by, 120, 30, IDC_N_NOTES, st->hFontNormal);
+        AddControl(hWnd, st, L"BUTTON", L"Mais tarde", BS_PUSHBUTTON | WS_TABSTOP,
+                   ClientW - Margin - 150 - 8 - 100, by, 100, 30, IDC_N_LATER, st->hFontNormal);
+        HWND hUpdate = AddControl(hWnd, st, L"BUTTON", L"Atualizar agora", BS_DEFPUSHBUTTON | WS_TABSTOP,
+                   ClientW - Margin - 150, by, 150, 30, IDC_N_UPDATE, st->hFontBold);
+        SetFocus(hUpdate);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        PaintNotice(hWnd, reinterpret_cast<HDC>(wParam), ns);
+        return 1;
+
+    case WM_PRINTCLIENT:
+        PaintNotice(hWnd, reinterpret_cast<HDC>(wParam), ns);
+        return 0;
+
+    case WM_CTLCOLORSTATIC:
+    case WM_CTLCOLORBTN: {
+        HWND hCtl = reinterpret_cast<HWND>(lParam);
+        RECT rc;
+        GetWindowRect(hCtl, &rc);
+        MapWindowPoints(nullptr, hWnd, reinterpret_cast<POINT*>(&rc), 2);
+        const bool inFooter = rc.top >= ns->panel->S(NoticeLayout::FooterTop);
+        const int id = GetDlgCtrlID(hCtl);
+        const bool muted = (id == IDC_N_HINT || id == IDC_N_LBL_CUR || id == IDC_N_LBL_NEW);
+
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        SetBkColor(hdc, inFooter ? Palette::FooterBg : Palette::BodyBg);
+        SetTextColor(hdc, muted ? Palette::MutedText : Palette::BodyText);
+        return reinterpret_cast<LRESULT>(inFooter ? ns->panel->hFooterBrush : ns->panel->hBodyBrush);
+    }
+
+    case WM_COMMAND: {
+        const int id = LOWORD(wParam);
+        if (id == IDC_N_UPDATE || id == IDOK) {
+            ns->accepted = true;
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        if (id == IDC_N_LATER || id == IDCANCEL) {
+            DestroyWindow(hWnd);
+            return 0;
+        }
+        if (id == IDC_N_NOTES) {
+            OpenReleasePage(ns->newVersion);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_CLOSE:
+        DestroyWindow(hWnd);
+        return 0;
+
+    case WM_DESTROY:
+        ns->isOpen = false;
+        PostMessageW(hWnd, WM_NULL, 0, 0);
+        return 0;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+// Mostra a tela de aviso (modal sobre o painel). Retorna true se o usuário
+// clicou em "Atualizar agora".
+static bool ShowUpdateNotice(HWND hPanel, const DialogState* st, const std::string& newVersion) {
+    NoticeState ns;
+    ns.panel = st;
+    ns.newVersion.assign(newVersion.begin(), newVersion.end());   // validado: só dígitos e pontos
+
+    ULONG_PTR actCookie = 0;
+    HANDLE hActCtx = ActivateVisualStyles(&actCookie);
+
+    HINSTANCE hInstance = GetModuleHandleW(nullptr);
+    const wchar_t* kNoticeClass = L"nanoAudioUpdateNoticeClass";
+    WNDCLASSEXW wc = {};
+    wc.cbSize        = sizeof(WNDCLASSEXW);
+    wc.lpfnWndProc   = NoticeWndProc;
+    wc.hInstance     = hInstance;
+    wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    wc.lpszClassName = kNoticeClass;
+    RegisterClassExW(&wc);
+
+    const DWORD dwStyle   = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    const DWORD dwExStyle = WS_EX_DLGMODALFRAME | WS_EX_TOPMOST;
+    RECT wr = { 0, 0, st->S(NoticeLayout::ClientW), st->S(NoticeLayout::ClientH) };
+    AdjustWindowRectEx(&wr, dwStyle, FALSE, dwExStyle);
+    const int w = wr.right - wr.left;
+    const int h = wr.bottom - wr.top;
+    RECT pr = {};
+    GetWindowRect(hPanel, &pr);
+    const int x = pr.left + ((pr.right - pr.left) - w) / 2;
+    const int y = pr.top + ((pr.bottom - pr.top) - h) / 2;
+
+    HWND hNotice = CreateWindowExW(dwExStyle, kNoticeClass, L"nanoAudio — Atualização disponível", dwStyle,
+                                   x, y, w, h, hPanel, nullptr, hInstance, &ns);
+    DeactivateVisualStyles(hActCtx, actCookie);
+    if (!hNotice) {
+        UnregisterClassW(kNoticeClass, hInstance);
+        return false;
+    }
+
+    EnableWindow(hPanel, FALSE);
+    ShowWindow(hNotice, SW_SHOW);
+    SetForegroundWindow(hNotice);
+    SetFocus(GetDlgItem(hNotice, IDC_N_UPDATE));
+    UpdateWindow(hNotice);
+
+    MSG msg = {};
+    BOOL got = TRUE;
+    while (ns.isOpen && (got = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+        if (!IsDialogMessageW(hNotice, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    if (got == 0) PostQuitMessage(static_cast<int>(msg.wParam));   // devolve o WM_QUIT ao loop externo
+
+    EnableWindow(hPanel, TRUE);
+    SetForegroundWindow(hPanel);
+    if (IsWindow(hNotice)) DestroyWindow(hNotice);
+    UnregisterClassW(kNoticeClass, hInstance);
+    return ns.accepted;
 }
 
 bool ShowControlPanelWindow(
