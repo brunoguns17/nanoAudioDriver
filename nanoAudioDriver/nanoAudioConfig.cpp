@@ -256,6 +256,12 @@ namespace Palette {
     constexpr COLORREF LatGood    = RGB(72, 207, 133);   // <= 10 ms
     constexpr COLORREF LatOk      = RGB(255, 191, 71);   // <= 25 ms
     constexpr COLORREF LatHigh    = RGB(255, 112, 92);   //  > 25 ms
+    // Botão principal ("Salvar e aplicar"): azul de destaque do Windows
+    constexpr COLORREF Accent        = RGB(0, 95, 184);
+    constexpr COLORREF AccentHover   = RGB(25, 117, 197);
+    constexpr COLORREF AccentPressed = RGB(0, 76, 150);
+    constexpr COLORREF AccentText    = RGB(255, 255, 255);
+    constexpr COLORREF DisabledFill  = RGB(204, 204, 204);
 }
 
 struct DialogState {
@@ -270,6 +276,7 @@ struct DialogState {
     long                          hwMax        = 2048;
     bool                          applied      = false;
     bool                          isOpen       = true;
+    bool                          saveHover    = false;  // mouse sobre "Salvar e aplicar"
     int                           dpi          = 96;
     HFONT                         hFontNormal  = nullptr;
     HFONT                         hFontBold    = nullptr;
@@ -400,6 +407,77 @@ static void SelectBufferByFrames(HWND hWnd, DialogState* pState, long frames) {
 static void FillRectColor(HDC hdc, const RECT& rc, COLORREF color) {
     SetDCBrushColor(hdc, color);
     FillRect(hdc, &rc, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+}
+
+// Desenha o botão principal (owner-draw) em azul, com estados de hover,
+// pressionado, desabilitado e foco de teclado. Botões com tema do Windows
+// não aceitam cor de fundo, por isso o desenho é feito aqui.
+static void DrawPrimaryButton(const DRAWITEMSTRUCT* dis, const DialogState* st, COLORREF parentBg, bool hover) {
+    HDC hdc = dis->hDC;
+    const RECT rc = dis->rcItem;
+    const bool pressed  = (dis->itemState & ODS_SELECTED) != 0;
+    const bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+    const bool focus    = (dis->itemState & ODS_FOCUS) != 0 && (dis->itemState & ODS_NOFOCUSRECT) == 0;
+
+    const COLORREF fill = disabled ? Palette::DisabledFill
+                        : pressed  ? Palette::AccentPressed
+                        : hover    ? Palette::AccentHover
+                                   : Palette::Accent;
+
+    FillRectColor(hdc, rc, parentBg);   // cantos arredondados mostram o fundo do rodapé
+
+    const int saved  = SaveDC(hdc);
+    const int radius = st->S(8);
+    SelectObject(hdc, GetStockObject(DC_BRUSH));
+    SelectObject(hdc, GetStockObject(DC_PEN));
+    SetDCBrushColor(hdc, fill);
+    SetDCPenColor(hdc, fill);
+    RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, radius, radius);
+
+    if (focus) {
+        // Contorno branco interno indica o foco do teclado (Tab)
+        const int inset = st->S(3);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        SetDCPenColor(hdc, Palette::AccentText);
+        RoundRect(hdc, rc.left + inset, rc.top + inset, rc.right - inset, rc.bottom - inset, radius - inset, radius - inset);
+    }
+
+    wchar_t text[64] = {};
+    GetWindowTextW(dis->hwndItem, text, 64);
+    RECT rText = rc;
+    if (pressed) OffsetRect(&rText, 0, st->S(1));
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, Palette::AccentText);
+    SelectObject(hdc, st->hFontBold);
+    DrawTextW(hdc, text, -1, &rText, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    RestoreDC(hdc, saved);
+}
+
+// Subclasse do botão principal: acompanha a entrada/saída do mouse para o hover.
+static LRESULT CALLBACK PrimaryButtonSubclass(HWND hBtn, UINT uMsg, WPARAM wParam, LPARAM lParam,
+                                              UINT_PTR idSubclass, DWORD_PTR refData) {
+    DialogState* st = reinterpret_cast<DialogState*>(refData);
+    switch (uMsg) {
+    case WM_MOUSEMOVE:
+        if (!st->saveHover) {
+            st->saveHover = true;
+            TRACKMOUSEEVENT tme = {};
+            tme.cbSize    = sizeof(tme);
+            tme.dwFlags   = TME_LEAVE;
+            tme.hwndTrack = hBtn;
+            TrackMouseEvent(&tme);
+            InvalidateRect(hBtn, nullptr, FALSE);
+        }
+        break;
+    case WM_MOUSELEAVE:
+        st->saveHover = false;
+        InvalidateRect(hBtn, nullptr, FALSE);
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hBtn, PrimaryButtonSubclass, idSubclass);
+        break;
+    }
+    return DefSubclassProc(hBtn, uMsg, wParam, lParam);
 }
 
 // Pinta cabeçalho, corpo e rodapé. Usado tanto em WM_ERASEBKGND quanto em
@@ -550,8 +628,9 @@ static void CreatePanelControls(HWND hWnd, DialogState* st) {
         AddControl(hWnd, st, L"BUTTON", L"Verificar atualizações", BS_PUSHBUTTON | WS_TABSTOP,
                    Margin + 150 + 8, by, 170, BtnH, IDC_BTN_UPDATES, st->hFontNormal);
     }
-    AddControl(hWnd, st, L"BUTTON", L"Salvar e aplicar", BS_DEFPUSHBUTTON | WS_TABSTOP,
+    HWND hSave = AddControl(hWnd, st, L"BUTTON", L"Salvar e aplicar", BS_OWNERDRAW | WS_TABSTOP,
                ClientW - Margin - 100 - 8 - 140, by, 140, BtnH, IDC_BTN_SAVE, st->hFontBold);
+    SetWindowSubclass(hSave, PrimaryButtonSubclass, 1, reinterpret_cast<DWORD_PTR>(st));
     AddControl(hWnd, st, L"BUTTON", L"Cancelar", BS_PUSHBUTTON | WS_TABSTOP,
                ClientW - Margin - 100, by, 100, BtnH, IDC_BTN_CANCEL, st->hFontNormal);
 }
@@ -724,6 +803,15 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         PopulatePanelControls(hWnd, pState);
         PostMessageW(hWnd, kMsgCheckPendingUpdate, 0, 0);
         return 0;
+    }
+
+    case WM_DRAWITEM: {
+        const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
+        if (dis->CtlID == IDC_BTN_SAVE) {
+            DrawPrimaryButton(dis, pState, Palette::FooterBg, pState->saveHover);
+            return TRUE;
+        }
+        break;
     }
 
     case WM_ERASEBKGND:
