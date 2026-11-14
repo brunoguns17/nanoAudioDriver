@@ -8,7 +8,7 @@
 #
 # A tarefa roda como SYSTEM ao iniciar o Windows (+5 min) e diariamente às 12:00
 # (se o PC estiver desligado no horário, roda assim que possível). Ela só
-# verifica e grava %ProgramData%\nanoAudio\update-available.txt; quem decide
+# verifica e grava <pasta de instalação>\update-available.txt; quem decide
 # instalar é o usuário, na tela de aviso que aparece ao abrir o Painel de Controle.
 # ============================================================================
 

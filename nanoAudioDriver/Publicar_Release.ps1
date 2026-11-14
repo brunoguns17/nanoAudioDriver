@@ -1,7 +1,8 @@
 ﻿# ============================================================================
 # Publicar_Release.ps1
-# Publica uma nova versão do nanoAudio no GitHub. Toda instalação com a opção
-# "Atualizar automaticamente" recebe a atualização na próxima verificação.
+# Publica uma nova versão do nanoAudio no GitHub. As instalações com a opção
+# "Avisar quando houver atualizações" detectam a versão na próxima verificação
+# e mostram o aviso quando o Painel de Controle for aberto.
 #
 #   powershell -ExecutionPolicy Bypass -File Publicar_Release.ps1 -Version 2.6.1
 #   powershell -ExecutionPolicy Bypass -File Publicar_Release.ps1 -Version 2.6.1 -Notes "Correções..."
@@ -170,5 +171,5 @@ if (-not $ok) {
 }
 
 Write-Host "`nRelease publicada: https://github.com/$repo/releases/tag/$tag" -ForegroundColor Green
-Write-Host "As instalações com atualização automática vão receber a $Version na próxima verificação (ao ligar o PC ou às 12:00)."
+Write-Host "As instalações detectam a $Version na próxima verificação (ao ligar o PC ou às 12:00) e mostram o aviso ao abrir o Painel de Controle."
 exit 0

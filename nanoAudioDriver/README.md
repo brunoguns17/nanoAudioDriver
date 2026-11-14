@@ -127,7 +127,7 @@ O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo W
 
 O instalador oficial inclui o `nanoAudioUpdater.exe` e cria a tarefa agendada **`\nanoAudio\Atualizador automatico`**. Ela roda ao iniciar o Windows (depois de 5 minutos) e diariamente às 12:00 (ou assim que possível, se o PC estiver desligado nesse horário).
 
-**A verificação não instala nada.** Ela consulta `https://github.com/brunoguns17/nanoAudioDriver/releases/latest/download/update-manifest.txt` (somente HTTPS; nenhum dado pessoal é enviado) e, se houver versão mais nova, apenas registra isso em `C:\ProgramData\nanoAudio\update-available.txt`.
+**A verificação não instala nada.** Ela consulta `https://github.com/brunoguns17/nanoAudioDriver/releases/latest/download/update-manifest.txt` (somente HTTPS; nenhum dado pessoal é enviado) e, se houver versão mais nova, apenas registra isso em `C:\Program Files\nanoAudio\update-available.txt` (pasta em que só administradores gravam).
 
 Na próxima vez que o usuário abrir o **Painel de Controle** (pelo Menu Iniciar ou de dentro da DAW), aparece a tela **"Atualização disponível"**, com as opções:
 * **Atualizar agora:** baixa o instalador, confere o SHA-256 informado no manifesto e instala (o Windows pede permissão de administrador). Se uma DAW estiver usando o driver, o atualizador mostra quais programas fechar; ele nunca fecha a DAW sozinho.
@@ -137,7 +137,7 @@ Na próxima vez que o usuário abrir o **Painel de Controle** (pelo Menu Iniciar
 O painel só lê esse arquivo local: nenhum acesso à internet acontece dentro da DAW. Também dá para verificar na hora pelo botão **Verificar atualizações** no painel ou pelo atalho no Menu Iniciar.
 
 * **Desativar:** reinstale e desmarque **"Avisar quando houver atualizações"**, ou desative a tarefa no Agendador de Tarefas do Windows.
-* **Logs:** `C:\ProgramData\nanoAudio\update.log` (verificação em segundo plano) e `%LOCALAPPDATA%\nanoAudio\update.log` (verificação/instalação pelo usuário).
+* **Logs:** `C:\Program Files\nanoAudio\update.log` (verificação em segundo plano) e `%LOCALAPPDATA%\nanoAudio\update.log` (verificação/instalação pelo usuário).
 * **Versões anteriores à 2.6.0** não têm o atualizador: instale uma versão nova manualmente uma vez.
 * **A versão 2.6.0** ainda instalava as atualizações sozinha, em segundo plano. Por isso, quem tem a 2.6.0 recebe a 2.6.1 automaticamente; dali em diante passa a valer o aviso no painel.
 * **Segurança:** ao clicar em "Atualizar agora", o atualizador instala com privilégios de administrador o que for publicado nas releases deste repositório. Proteja a conta do GitHub com autenticação em dois fatores.

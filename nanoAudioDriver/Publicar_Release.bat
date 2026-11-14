@@ -4,7 +4,7 @@ title Publicar Release — nanoAudio ASIO Driver
 cd /d "%~dp0"
 
 echo ============================================================================
-echo   PUBLICAR NOVA RELEASE NO GITHUB (com atualização automática)
+echo   PUBLICAR NOVA RELEASE NO GITHUB (com aviso de atualização no painel)
 echo ============================================================================
 echo.
 for /f "tokens=3" %%v in ('findstr /c:"#define NANOAUDIO_VERSION_STR " nanoAudioVersion.h') do echo Versão atual: %%~v

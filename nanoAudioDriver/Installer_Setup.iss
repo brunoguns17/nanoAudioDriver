@@ -47,8 +47,8 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 ; A tarefa agendada roda como SYSTEM e só VERIFICA (nunca instala): grava a versão nova em
-; {commonappdata}\nanoAudio\update-available.txt, que o painel lê ao abrir. Só existe em
-; instalação de administrador (o executável fica em Program Files).
+; {app}\update-available.txt, que o painel lê ao abrir. Só existe em instalação de
+; administrador ({app} fica em Program Files, onde usuários comuns não gravam).
 ; O nome "autoupdate" é mantido para o Inno lembrar a escolha feita em versões anteriores.
 Name: "autoupdate"; Description: "Avisar quando houver atualizações (consulta o GitHub ao iniciar o Windows e uma vez por dia; o aviso aparece ao abrir o Painel de Controle)"; GroupDescription: "Atualizações:"; Check: IsAdminInstallMode
 
@@ -96,4 +96,7 @@ Filename: "{#PowerShellExe}"; Parameters: "-NoProfile -ExecutionPolicy Bypass -F
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\Updates"
+Type: files; Name: "{app}\update-available.txt"
+Type: files; Name: "{app}\update.log"
+; Pasta usada pelo log da versão 2.6.0
 Type: filesandordirs; Name: "{commonappdata}\nanoAudio"

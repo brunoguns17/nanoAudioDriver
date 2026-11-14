@@ -8,9 +8,10 @@
 //
 // Modos:
 //   --silent       Verificação em segundo plano (tarefa agendada). NÃO instala:
-//                  só grava a versão nova em %ProgramData%\nanoAudio\
-//                  update-available.txt. O painel de controle lê esse arquivo
-//                  ao abrir e mostra a tela "Atualização disponível".
+//                  só grava a versão nova em <pasta de instalação>\
+//                  update-available.txt (log em <pasta de instalação>\
+//                  update.log). O painel de controle lê esse arquivo ao abrir
+//                  e mostra a tela "Atualização disponível".
 //   --interactive  (padrão) Aberto pelo painel/Menu Iniciar: pergunta, baixa o
 //                  instalador, confere o SHA-256, pede para fechar programas
 //                  que usam o driver e executa o instalador (com UAC).
@@ -528,11 +529,33 @@ int RunUpdate(const Options& opt) {
 
     // 4. Verificação de integridade. O arquivo fica aberto (sem permitir escrita
     //    por terceiros) desde o hash até o instalador ser iniciado.
-    HANDLE hSetup = CreateFileW(localPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    //    Logo após o download o antivírus costuma abrir o .exe para examiná-lo,
+    //    o que gera violação de compartilhamento por alguns instantes.
+    HANDLE hSetup = INVALID_HANDLE_VALUE;
+    DWORD openError = 0;
+    for (int attempt = 0; attempt < 40; ++attempt) {
+        hSetup = CreateFileW(localPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hSetup != INVALID_HANDLE_VALUE) break;
+        openError = GetLastError();
+        if (openError != ERROR_SHARING_VIOLATION && openError != ERROR_LOCK_VIOLATION) break;
+        Sleep(250);
+    }
+    if (hSetup == INVALID_HANDLE_VALUE) {
+        Log(L"Não foi possível abrir o instalador baixado: " + Win32Error(openError));
+        DeleteFileW(localPath.c_str());
+        if (openError == ERROR_VIRUS_INFECTED || openError == ERROR_VIRUS_DELETED) {
+            Message(opt, L"O antivírus do Windows bloqueou o instalador da versão " + newVer + L".\n"
+                         L"A atualização foi cancelada.", MB_ICONWARNING | MB_OK);
+        } else {
+            Message(opt, L"Não foi possível abrir o instalador baixado.\n\nDetalhes: " + Win32Error(openError),
+                    MB_ICONERROR | MB_OK);
+        }
+        return kError;
+    }
     std::string actualHash;
-    if (hSetup == INVALID_HANDLE_VALUE || !Sha256OfHandle(hSetup, actualHash) || actualHash != m.sha256) {
+    if (!Sha256OfHandle(hSetup, actualHash) || actualHash != m.sha256) {
         Log(L"SHA-256 não confere. Esperado " + Widen(m.sha256) + L", obtido " + Widen(actualHash));
-        if (hSetup != INVALID_HANDLE_VALUE) CloseHandle(hSetup);
+        CloseHandle(hSetup);
         DeleteFileW(localPath.c_str());
         Message(opt, L"O arquivo baixado não passou na verificação de integridade (SHA-256).\n"
                      L"A atualização foi cancelada por segurança.", MB_ICONERROR | MB_OK);
@@ -625,8 +648,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
 
     if (!opt.logPath.empty()) {
         g_logPath = opt.logPath;
+    } else if (opt.silent) {
+        // Tarefa como SYSTEM: log na pasta de instalação (só admins gravam),
+        // nunca em %ProgramData%, onde qualquer usuário pode criar a pasta antes.
+        g_logPath = ExeDir() + L"\\update.log";
     } else {
-        std::wstring base = EnvPath(opt.silent ? L"ProgramData" : L"LOCALAPPDATA");
+        std::wstring base = EnvPath(L"LOCALAPPDATA");
         if (!base.empty()) {
             base += L"\\nanoAudio";
             if (EnsureDir(base)) g_logPath = base + L"\\update.log";

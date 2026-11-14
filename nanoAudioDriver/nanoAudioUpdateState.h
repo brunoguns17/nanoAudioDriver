@@ -4,7 +4,7 @@
 // painel de controle.
 //
 // A verificação em segundo plano (nanoAudioUpdater.exe --silent, tarefa
-// agendada) grava a versão nova em %ProgramData%\nanoAudio\update-available.txt.
+// agendada) grava a versão nova em <pasta de instalação>\update-available.txt.
 // O painel (inclusive dentro da DAW) apenas LÊ esse arquivo local ao abrir;
 // nenhum acesso à rede acontece dentro do processo da DAW.
 // ============================================================================
@@ -48,15 +48,23 @@ inline bool IsNewer(const std::string& candidate, const std::string& current) {
     return ParseVersion(candidate, a) && ParseVersion(current, b) && CompareVersions(a, b) > 0;
 }
 
-inline std::wstring StateDir() {
-    wchar_t buf[MAX_PATH] = {};
-    DWORD n = GetEnvironmentVariableW(L"ProgramData", buf, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH) return {};
-    return std::wstring(buf, n) + L"\\nanoAudio";
+// Pasta de instalação = pasta do módulo que contém este código (o .exe do
+// atualizador/painel ou a DLL do driver carregada pela DAW). Em Program Files
+// só administradores gravam e todos leem: o SYSTEM grava o aviso ali sem que
+// um usuário comum possa adulterá-lo (ao contrário de %ProgramData%).
+inline std::wstring InstallDir() {
+    HMODULE hMod = nullptr;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&InstallDir), &hMod);
+    wchar_t path[MAX_PATH * 2] = {};
+    DWORD n = GetModuleFileNameW(hMod, path, MAX_PATH * 2);
+    std::wstring dir(path, n);
+    size_t slash = dir.find_last_of(L"\\/");
+    return (slash == std::wstring::npos) ? std::wstring() : dir.substr(0, slash);
 }
 
 inline std::wstring StateFilePath() {
-    std::wstring dir = StateDir();
+    std::wstring dir = InstallDir();
     return dir.empty() ? std::wstring() : dir + L"\\update-available.txt";
 }
 
@@ -86,7 +94,6 @@ inline std::string ReadPendingUpdate(const std::string& current) {
 inline bool WritePendingUpdate(const std::string& version) {
     const std::wstring path = StateFilePath();
     if (path.empty()) return false;
-    CreateDirectoryW(StateDir().c_str(), nullptr);
     const std::wstring tmp = path + L".tmp";
     HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) return false;
