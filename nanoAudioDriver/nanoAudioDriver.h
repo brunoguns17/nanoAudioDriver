@@ -1,5 +1,5 @@
 // ============================================================================
-// nanoAudioDriver.h — nanoAudio ASIO Driver (v2.5)
+// nanoAudioDriver.h — nanoAudio ASIO Driver (versão em nanoAudioVersion.h)
 // Header do Driver ASIO Universal nanoAudio de Baixa Latência para Windows 10/11
 // Inclui Painel de Controle Gráfico Win32 (Seleção de Mesa de Som, Saída e Buffer),
 // Ring Buffer FIFO de Captura e Conversão Automática de Qualquer Formato/Taxa.
@@ -241,11 +241,6 @@ public:
     // Métodos auxiliares para o Painel de Controle Win32
     DriverUserConfig& GetConfig() { return m_config; }
     void ApplyNewConfigFromGui(const DriverUserConfig& newCfg);
-    const wchar_t* GetActiveCaptureName() const { return m_captureDeviceName; }
-    const wchar_t* GetActiveRenderName() const  { return m_renderDeviceName; }
-    bool IsCaptureStreaming() const             { return m_captureStreamActive.load(); }
-    float GetInputPeakLevel() const             { return m_inputPeakMeter.load(); }
-    double GetCurrentSampleRate() const         { return m_sampleRate; }
 
 private:
     bool  ProbeHardwareCapabilities();
@@ -253,6 +248,11 @@ private:
     static void GetEndpointFriendlyName(IMMDevice* pDevice, wchar_t* outName, size_t maxLen);
     static DWORD WINAPI AudioThreadProc(LPVOID param);
     DWORD RunRealTimeAudioLoop();
+    long  ActiveInputCount() const;
+    long  ActiveOutputCount() const;
+    void  UpdateLatencyEstimate(long blockFrames);
+    bool  HostSupports(long selector) const;
+    void  RequestHostReset();
     void  ShowNativeControlPanelDialog();
     void  SetError(const char* msg);
 
@@ -260,41 +260,42 @@ private:
     volatile LONG                   m_refCount;
     HWND                            m_sysHandle               = nullptr;
     bool                            m_comInitialized          = false;
+    DWORD                           m_comThreadId             = 0;
     bool                            m_initialized             = false;
     bool                            m_buffersCreated          = false;
     char                            m_errorMsg[128]           = {};
 
     DriverUserConfig                m_config                  = {};
-    wchar_t                         m_renderDeviceName[128]   = L"Saída Padrão do Windows";
-    wchar_t                         m_captureDeviceName[128]  = L"Entrada Padrão / Mesa USB";
-
+    DriverUserConfig                m_streamConfig            = {};    // cópia usada pela thread de áudio
+    std::wstring                    m_renderId;                        // endpoints resolvidos (ver ProbeHardwareCapabilities)
+    std::wstring                    m_captureId;
     long                            m_numInputs               = 2;
-    long                            m_hwCaptureChannels       = 2;
     long                            m_numOutputs              = 2;
     double                          m_nativeMixRate           = 48000.0;
-    double                          m_nativeCaptureRate       = 48000.0;
-    ASIOSampleRate                  m_sampleRate              = 48000.0;
+    std::atomic<double>             m_sampleRate{48000.0};
 
-    long                            m_hwMinBufferFrames       = 64;
-    long                            m_hwPreferredBufferFrames = 256;
-    long                            m_hwMaxBufferFrames       = 2048;
-    long                            m_hwGranularityFrames     = 32;
-    long                            m_engineOverheadFrames    = 64;
+    // O FIFO desacopla o bloco ASIO do período do WASAPI: qualquer tamanho é aceito.
+    static constexpr long           kMinBufferFrames          = 32;
+    static constexpr long           kPreferredBufferFrames    = 256;
+    static constexpr long           kMaxBufferFrames          = 2048;
+    static constexpr long           kBufferGranularity        = 32;
 
     long                            m_activeBufferFrames      = 256;
-    long                            m_inputLatencyFrames      = 256;
-    long                            m_outputLatencyFrames     = 320;
+    std::atomic<long>               m_inputLatencyFrames{256};
+    std::atomic<long>               m_outputLatencyFrames{1024};
 
     ASIOCallbacks                   m_callbacks               = {};
+    bool                            m_hostUsesTimeInfo        = false;
     std::vector<ASIOBufferInfo>     m_activeChannels;
     std::vector<std::vector<float>> m_channelMemory;
 
     std::atomic<bool>               m_running{false};
-    std::atomic<bool>               m_captureStreamActive{false};
-    std::atomic<float>              m_inputPeakMeter{0.0f};
+    std::atomic<bool>               m_hostUsesOutputReady{false};
     std::atomic<uint64_t>           m_samplePosition{0};
     std::atomic<uint64_t>           m_systemTimeNs{0};
     HANDLE                          m_audioThread             = nullptr;
+    DWORD                           m_audioThreadId           = 0;
     HANDLE                          m_stopEvent               = nullptr;
     HANDLE                          m_renderEvent             = nullptr;
+    HANDLE                          m_outputReadyEvent        = nullptr;
 };

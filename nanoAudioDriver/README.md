@@ -1,22 +1,27 @@
 # nanoAudio — Universal WASAPI Low-Latency ASIO Driver
 
-Driver ASIO universal em C++ (COM In-Process Server 64-bit/32-bit) projetado para Windows 10 e Windows 11, construído sobre a API nativa [**IAudioClient3 (WASAPI Low Latency)**](https://learn.microsoft.com/en-us/windows-hardware/drivers/audio/low-latency-audio) e compatível com a especificação binária do [**Steinberg ASIO SDK 2.3**](https://www.steinberg.net/developers/asiosdk-open/).
+Driver ASIO universal em C++ (COM In-Process Server 64-bit/32-bit) projetado para Windows 10 e Windows 11, construído sobre a API nativa [**WASAPI**](https://learn.microsoft.com/en-us/windows/win32/coreaudio/wasapi) e compatível com a especificação binária do [**Steinberg ASIO SDK 2.3**](https://www.steinberg.net/developers/asiosdk-open/).
 
 ## O Que Este Driver Resolve em Relação ao ASIO4ALL
 
 | Problema no ASIO4ALL | Solução Implementada no Código | 
 | ----- | ----- | 
-| **1. Bloqueio do Áudio do Sistema (Monopólio)** | Inicializa o endpoint via `IAudioClient3::InitializeSharedAudioStream` ([WASAPI](https://learn.microsoft.com/en-us/windows/win32/coreaudio/wasapi) Shared Mode), permitindo usar a DAW simultaneamente com YouTube, Spotify e Discord | 
+| **1. Bloqueio do Áudio do Sistema (Monopólio)** | Usa o modo compartilhado do WASAPI por padrão, permitindo usar a DAW simultaneamente com YouTube, Spotify e Discord | 
 | **2. Instabilidade ("X" Vermelho)** | Evita o sequestro exclusivo WDM-KS e gerencia os buffers de captura e renderização sem travar quando outros aplicativos abrem a placa de som | 
-| **3. Buffer Dinâmico conforme a Placa do Usuário** | Consulta `IAudioClient3::GetSharedModeEnginePeriod` em `ProbeHardwareCapabilities()` para detectar `minPeriodInFrames`, `defaultPeriodInFrames` e `maxPeriodInFrames` da placa de som do usuário e repassa via `IASIO::getBufferSize()` | 
+| **3. Buffer Dinâmico conforme a Placa do Usuário** | Ao abrir o áudio, toca 400 ms de silêncio para medir quantos frames a placa consome de uma vez e ajusta a fila de saída. A entrada usa um FIFO que aprende a folga necessária e compensa a diferença de relógio entre dispositivos (`nanoAudioCaptureFifo.h`) | 
 | **4. Consumo Elevado de CPU** | Loop *Event-Driven* (`AUDCLNT_STREAMFLAGS_EVENTCALLBACK`) sem alocações na thread de tempo real e registrado no agendador de kernel [**MMCSS**](https://learn.microsoft.com/en-us/windows/win32/procthread/multimedia-class-scheduler-service) com perfil `"Pro Audio"` (`AVRT_PRIORITY_CRITICAL`) | 
 | **5. Conflito de Sample Rate (44.1 kHz vs 48 kHz)** | Ativa automaticamente as flags [**`AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM`**](https://learn.microsoft.com/en-us/windows/win32/coreaudio/audclnt-streamflags-xxx-constants) e `AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY` quando a taxa da DAW difere da taxa nativa do Windows | 
+| **6. Volume mais baixo que no WDM/KS** | No modo compartilhado, o volume do Windows (quando feito por software) atenua o áudio da DAW. O driver compensa essa atenuação sem distorção e sem mexer no volume dos outros programas (`nanoAudioVolume.h`). Veja [Volume do Windows](#volume-do-windows) | 
 
 ## Estrutura de Arquivos do Projeto
 
 * `nanoAudioDriver.h`: Declaração da interface binária COM `IASIO` (compatível com a VTable oficial da Steinberg), estruturas de buffer/tempo e definição da classe `UniversalWasapiAsioDriver`.
 
-* `nanoAudioDriver.cpp`: Implementação completa do motor WASAPI (`IAudioClient3`), detecção dinâmica de buffer por hardware, thread de áudio *Pro Audio*, painel de controle Win32 (`IASIO::controlPanel`) e auto-registro no Registro do Windows (`DllRegisterServer`).
+* `nanoAudioDriver.cpp`: Implementação do motor WASAPI (compartilhado e exclusivo), calibração da fila por hardware, thread de áudio *Pro Audio*, painel de controle Win32 (`IASIO::controlPanel`) e auto-registro no Registro do Windows (`DllRegisterServer`).
+
+* `nanoAudioCaptureFifo.h`: FIFO da entrada com reamostrador (sinc + Kaiser), controle automático de nível e compensação de relógio.
+
+* `nanoAudioVolume.h`: Consulta e compensação do volume do Windows na saída.
 
 * `nanoAudioConfig.cpp` / `nanoAudioConfigMain.cpp`: Painel de controle gráfico (usado pela DLL dentro da DAW e pelo `nanoAudioControlPanel.exe`).
 
@@ -47,7 +52,7 @@ O arquivo `nanoAudioDriver.dll` será gerado em `build/Release/nanoAudioDriver.d
 No **x64 Native Tools Command Prompt for VS**, execute:
 
 ```
-cl /LD /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioDriver.cpp ole32.lib uuid.lib avrt.lib user32.lib gdi32.lib advapi32.lib
+cl /LD /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp ole32.lib uuid.lib avrt.lib winmm.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ksuser.lib /link /DEF:nanoAudioDriver.def
 
 ```
 
@@ -97,15 +102,16 @@ Esse modo não instala o aviso de atualizações.
 
 O driver inclui um Painel de Controle nativo em Win32 que pode ser aberto tanto de **dentro de qualquer DAW** (ao clicar em *Control Panel* / *Driver Settings*) quanto diretamente pelo **Menu Iniciar** ou área de trabalho via **`nanoAudioControlPanel.exe`**.
 
-O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo WASAPI à direita) e mostra no cabeçalho a **latência estimada de ida e volta**, recalculada ao vivo conforme o buffer, o sample rate e o modo escolhidos (verde até 10 ms, amarelo até 25 ms, vermelho acima disso). A janela usa o visual moderno do Windows; o `nanoAudioControlPanel.exe` fica nítido em telas com zoom de 125%, 150% etc. (dentro da DAW, a nitidez depende do modo de DPI da própria DAW).
+O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo WASAPI à direita) e mostra no cabeçalho a **latência mínima de ida e volta**, recalculada ao vivo conforme o buffer, o sample rate e o modo escolhidos (verde até 40 ms, amarelo até 60 ms, vermelho acima disso). O valor inclui o que o mixer do Windows acrescenta; drivers USB antigos somam a própria latência. Com o áudio rodando, o driver mede a latência real e a informa à DAW, que a usa para alinhar as gravações. A janela usa o visual moderno do Windows; o `nanoAudioControlPanel.exe` fica nítido em telas com zoom de 125%, 150% etc. (dentro da DAW, a nitidez depende do modo de DPI da própria DAW).
 
 ### O que pode ser configurado:
 1. **🎧 Saída de Áudio (Playback):** Escolha qual placa ou interface reproduz o som (ex: *BEHRINGER USB Audio*, *Alto-falantes Realtek*, etc.) ou mantenha no *Padrão do Windows*.
-2. **Canais de Saída:** Selecione entre **2 Canais (Estéreo)**, **4 Canais (Quad)**, **6 Canais (5.1)** ou **8 Canais (7.1)**.
+2. **Canais de Saída:** Selecione entre **2 Canais (Estéreo)**, **4 Canais (Quad)**, **6 Canais (5.1)** ou **8 Canais (7.1)**. O driver nunca anuncia à DAW mais canais do que o dispositivo tem.
+   * **Ignorar o volume do Windows:** veja [Volume do Windows](#volume-do-windows).
 3. **🎙️ Entrada de Áudio (Recording):** Escolha o microfone ou interface de captura (ex: *BEHRINGER USB In*, *Microfone Realtek*), com opção de ativar/desativar a captura (Full Duplex).
 4. **Canais de Entrada:** Selecione **1 Canal (Mono)** ou **2 Canais (Estéreo In 1 / In 2)**.
-5. **🎛️ Sample Rate (Taxa de Amostragem):** 44.1 kHz (44100 Hz), 48.0 kHz (48000 Hz), 88.2 kHz, 96.0 kHz ou 192.0 kHz.
-6. **Resolução de Bits (Bit Depth):**
+5. **🎛️ Sample Rate (Taxa de Amostragem):** Automático (a mesma taxa do Windows, sem conversão — recomendado), 44.1 kHz (44100 Hz), 48.0 kHz (48000 Hz), 88.2 kHz, 96.0 kHz ou 192.0 kHz.
+6. **Resolução de Bits (Bit Depth):** vale para o modo exclusivo (se o dispositivo não aceitar a escolhida, o driver usa a próxima que ele aceite). No compartilhado o áudio segue em 32-bit float.
    * **32-bit Float:** Máxima faixa dinâmica sem risco de clipping digital interno (Recomendado para DAWs).
    * **24-bit PCM:** Alta definição para gravação e interfaces profissionais.
    * **16-bit PCM:** Compatibilidade máxima (Padrão CD).
@@ -119,7 +125,17 @@ O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo W
    * 2048 samples (~42.7 ms a 48kHz — Máxima Estabilidade)
 8. **Modo WASAPI:**
    * **Modo Compartilhado (Shared):** Não bloqueia o Windows. Permite tocar na DAW e ouvir YouTube, Spotify e Discord simultaneamente.
-   * **Modo Exclusivo (Exclusive):** Monopoliza a interface para garantir a menor latência possível sem interferência do sistema operacional.
+   * **Modo Exclusivo (Exclusive):** Monopoliza a interface: menor latência, sem o mixer nem o volume por software do Windows. Os outros programas ficam sem som nesse dispositivo. Se o dispositivo não aceitar, o driver volta para o compartilhado.
+
+### Volume do Windows
+
+Dispositivos sem controle de volume próprio (comum em mesas e interfaces USB) têm o volume aplicado **por software** pelo mixer do Windows. Como o WDM/KS e os drivers ASIO nativos não passam pelo mixer, o mesmo projeto soava mais baixo no nanoAudio: com o Windows em 40% na Behringer USB, a diferença era de 13,9 dB.
+
+Com **Ignorar o volume do Windows** marcado (padrão), o driver aplica o ganho inverso e o áudio da DAW sai no nível original. Os outros programas continuam no volume escolhido no Windows.
+
+* O mudo e o volume zero são respeitados, e a compensação é limitada a +30 dB.
+* Se o volume é do próprio hardware (ex.: Realtek), ele também vale para o WDM/KS e nada é alterado.
+* Para controlar o volume da DAW pelo Windows, desmarque a opção.
 
 ---
 

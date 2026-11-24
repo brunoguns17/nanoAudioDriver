@@ -1,27 +1,25 @@
 // ============================================================================
-// nanoAudioDriver.cpp — nanoAudio ASIO Driver (v2.5)
-// Implementação Completa do Driver ASIO Universal nanoAudio (Windows 10/11)
+// nanoAudioDriver.cpp — nanoAudio ASIO Driver (versão em nanoAudioVersion.h)
+// Implementação do driver ASIO universal nanoAudio (Windows 10/11) sobre WASAPI
 //
-// Novidades da v2.5:
-// 1. Inclui <initguid.h> antes das headers de dispositivo para garantir que a
-//    compilação via cl.exe/CMake nunca falhe com erro de símbolo PKEY_Device_FriendlyName.
-// 2. Painel de Controle Gráfico Win32 real (janela interativa com listas dropdown)
-//    acessível pelo botão "ASIO Configuration..." do Reaper (mesmo quando sysHandle
-//    é nulo ou inválido), permitindo escolher:
-//    - Dispositivo de Entrada (Mesa de Som USB / Linha / Microfone)
-//    - Dispositivo de Saída (Fones / Caixas / Interface)
-//    - Tamanho do Buffer (64, 128, 256, 512, 1024, 2048 samples)
-//    - Modo Compartilhado vs. Exclusivo e Medidor de Pico da Entrada!
-// 3. Captura de áudio MTA-Safe usando o próprio GetMixFormat() da mesa de som
-//    com conversão automática (16/24/32-bit, Mono->Stereo, 44.1<->48 kHz) e
-//    loop híbrido (Evento WASAPI + Fallback de Timer de 1 ms) que nunca trava.
+// - <initguid.h> vem antes das headers de dispositivo para que PKEY_Device_FriendlyName
+//   seja definido em qualquer compilador.
+// - Saída: modo compartilhado (com compensação do volume do Windows, veja
+//   nanoAudioVolume.h) ou exclusivo (direto no hardware).
+// - Entrada: FIFO com controle automático de nível (nanoAudioCaptureFifo.h).
+// - O painel de controle fica em nanoAudioConfig.cpp.
 // ============================================================================
 
 #include <initguid.h>
 #include "nanoAudioDriver.h"
+#include "nanoAudioCaptureFifo.h"
+#include "nanoAudioVersion.h"
+#include "nanoAudioVolume.h"
+#include <audiopolicy.h>
 #include <cwctype>
 #include <cstdarg>
 #include <cwchar>
+#include <new>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
@@ -93,8 +91,10 @@ UniversalWasapiAsioDriver::UniversalWasapiAsioDriver() : m_refCount(1) {
 }
 
 UniversalWasapiAsioDriver::~UniversalWasapiAsioDriver() {
-    stop();
     disposeBuffers();
+    if (m_outputReadyEvent) CloseHandle(m_outputReadyEvent);
+    // Só desfaz o CoInitializeEx() do init() se estiver na mesma thread (exigência do COM)
+    if (m_comInitialized && m_comThreadId == GetCurrentThreadId()) CoUninitialize();
     g_dllRefCount.fetch_sub(1);
 }
 
@@ -123,16 +123,18 @@ ASIOBool UniversalWasapiAsioDriver::init(void* sysHandle) {
     HWND candidateHwnd = reinterpret_cast<HWND>(sysHandle);
     m_sysHandle = (candidateHwnd && IsWindow(candidateHwnd)) ? candidateHwnd : nullptr;
     m_config = LoadUserConfig();
-    if (m_config.preferredSampleRate > 0) {
-        m_sampleRate = static_cast<double>(m_config.preferredSampleRate);
-    }
 
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    m_comInitialized = SUCCEEDED(hr);
+    if (!m_comInitialized) {
+        m_comInitialized = SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+        m_comThreadId    = GetCurrentThreadId();
+    }
 
     // Mesmo que não haja dispositivo de entrada ativo no momento, inicializa o driver
     // com valores seguros para nunca impedir a abertura do Painel de Controle no Reaper.
     ProbeHardwareCapabilities();
+    m_sampleRate = (m_config.preferredSampleRate > 0) ? static_cast<double>(m_config.preferredSampleRate)
+                                                      : m_nativeMixRate;
+    UpdateLatencyEstimate(m_config.customBufferFrames > 0 ? m_config.customBufferFrames : kPreferredBufferFrames);
 
     m_initialized = true;
     return ASIOTrue;
@@ -143,7 +145,10 @@ void UniversalWasapiAsioDriver::getDriverName(char* name) {
 }
 
 long UniversalWasapiAsioDriver::getDriverVersion() {
-    return 0x00020005L; // nanoAudio v2.5
+    // "2.6.2" -> 0x00020602
+    long v[3] = {};
+    std::sscanf(NANOAUDIO_VERSION_STR, "%ld.%ld.%ld", &v[0], &v[1], &v[2]);
+    return (v[0] << 16) | ((v[1] & 0xFF) << 8) | (v[2] & 0xFF);
 }
 
 void UniversalWasapiAsioDriver::getErrorMessage(char* string) {
@@ -152,30 +157,36 @@ void UniversalWasapiAsioDriver::getErrorMessage(char* string) {
 
 ASIOError UniversalWasapiAsioDriver::getChannels(long* numInputChannels, long* numOutputChannels) {
     if (!numInputChannels || !numOutputChannels) return ASE_InvalidParameter;
-    *numInputChannels  = m_config.enableInputCapture ? (m_config.numChannelsIn > 0 ? m_config.numChannelsIn : m_numInputs) : 0;
-    *numOutputChannels = (m_config.numChannelsOut > 0) ? m_config.numChannelsOut : m_numOutputs;
+    *numInputChannels  = ActiveInputCount();
+    *numOutputChannels = ActiveOutputCount();
     return ASE_OK;
+}
+
+long UniversalWasapiAsioDriver::ActiveInputCount() const {
+    if (!m_config.enableInputCapture) return 0;
+    return (m_config.numChannelsIn > 0) ? std::min(m_config.numChannelsIn, m_numInputs) : m_numInputs;
+}
+
+// Nunca anuncia mais canais do que o dispositivo tem: o excedente não sairia em lugar nenhum.
+long UniversalWasapiAsioDriver::ActiveOutputCount() const {
+    return (m_config.numChannelsOut > 0) ? std::min(m_config.numChannelsOut, m_numOutputs) : m_numOutputs;
 }
 
 ASIOError UniversalWasapiAsioDriver::getLatencies(long* inputLatency, long* outputLatency) {
     if (!inputLatency || !outputLatency) return ASE_InvalidParameter;
-    *inputLatency  = m_inputLatencyFrames;
-    *outputLatency = m_outputLatencyFrames;
+    *inputLatency  = m_inputLatencyFrames.load();
+    *outputLatency = m_outputLatencyFrames.load();
     return ASE_OK;
 }
 
 ASIOError UniversalWasapiAsioDriver::getBufferSize(long* minSize, long* maxSize, long* preferredSize, long* granularity) {
     if (!minSize || !maxSize || !preferredSize || !granularity) return ASE_InvalidParameter;
 
-    *minSize       = m_hwMinBufferFrames;
-    *maxSize       = m_hwMaxBufferFrames;
-    long customBuf = m_config.customBufferFrames;
-    if (customBuf > 0 && customBuf >= m_hwMinBufferFrames && customBuf <= m_hwMaxBufferFrames) {
-        *preferredSize = customBuf;
-    } else {
-        *preferredSize = m_hwPreferredBufferFrames;
-    }
-    *granularity   = m_hwGranularityFrames;
+    const long customBuf = m_config.customBufferFrames;
+    *minSize       = kMinBufferFrames;
+    *maxSize       = kMaxBufferFrames;
+    *preferredSize = (customBuf >= kMinBufferFrames && customBuf <= kMaxBufferFrames) ? customBuf : kPreferredBufferFrames;
+    *granularity   = kBufferGranularity;
     return ASE_OK;
 }
 
@@ -195,8 +206,14 @@ ASIOError UniversalWasapiAsioDriver::getSampleRate(ASIOSampleRate* sampleRate) {
 
 ASIOError UniversalWasapiAsioDriver::setSampleRate(ASIOSampleRate sampleRate) {
     if (canSampleRate(sampleRate) != ASE_OK) return ASE_NoClock;
+    if (std::fabs(m_sampleRate.load() - sampleRate) < 1.0) return ASE_OK;
+
+    // Com o áudio rodando, os streams do WASAPI precisam ser reabertos na nova taxa
+    const bool restart = m_running.load() && GetCurrentThreadId() != m_audioThreadId;
+    if (restart) stop();
     m_sampleRate = sampleRate;
-    return ASE_OK;
+    UpdateLatencyEstimate(m_activeBufferFrames);
+    return restart ? start() : ASE_OK;
 }
 
 ASIOError UniversalWasapiAsioDriver::getClockSources(ASIOClockSource* clocks, long* numSources) {
@@ -228,12 +245,13 @@ ASIOError UniversalWasapiAsioDriver::getSamplePosition(ASIOSamples* sPos, ASIOTi
 
 ASIOError UniversalWasapiAsioDriver::getChannelInfo(ASIOChannelInfo* info) {
     if (!info) return ASE_InvalidParameter;
-    long maxCh = info->isInput
-        ? (m_config.enableInputCapture ? (m_config.numChannelsIn > 0 ? m_config.numChannelsIn : m_numInputs) : 0)
-        : ((m_config.numChannelsOut > 0) ? m_config.numChannelsOut : m_numOutputs);
+    const long maxCh = info->isInput ? ActiveInputCount() : ActiveOutputCount();
     if (info->channel < 0 || info->channel >= maxCh) return ASE_InvalidParameter;
 
-    info->isActive     = m_buffersCreated ? ASIOTrue : ASIOFalse;
+    info->isActive = ASIOFalse;
+    for (const ASIOBufferInfo& bi : m_activeChannels) {
+        if (!!bi.isInput == !!info->isInput && bi.channelNum == info->channel) info->isActive = ASIOTrue;
+    }
     info->channelGroup = 0;
     info->type         = ASIOSTFloat32LSB;
     std::snprintf(
@@ -248,13 +266,20 @@ ASIOError UniversalWasapiAsioDriver::getChannelInfo(ASIOChannelInfo* info) {
 
 ASIOError UniversalWasapiAsioDriver::createBuffers(
     ASIOBufferInfo* bufferInfos, long numChannels, long bufferSize, ASIOCallbacks* callbacks) {
-    if (!bufferInfos || !callbacks || bufferSize <= 0) return ASE_InvalidParameter;
-    disposeBuffers();
+    if (!bufferInfos || !callbacks || numChannels <= 0) return ASE_InvalidParameter;
+    if (!callbacks->bufferSwitch && !callbacks->bufferSwitchTimeInfo) return ASE_InvalidParameter;
+    if (bufferSize < 16 || bufferSize > 8192) return ASE_InvalidMode;
+    for (long i = 0; i < numChannels; ++i) {
+        const long maxCh = bufferInfos[i].isInput ? ActiveInputCount() : ActiveOutputCount();
+        if (bufferInfos[i].channelNum < 0 || bufferInfos[i].channelNum >= maxCh) return ASE_InvalidParameter;
+    }
+    const ASIOError disposed = disposeBuffers();
+    if (disposed != ASE_OK) return disposed;
 
     m_activeBufferFrames = bufferSize;
     m_callbacks          = *callbacks;
     m_activeChannels.resize(numChannels);
-    m_channelMemory.resize(numChannels * 2);
+    m_channelMemory.resize(static_cast<size_t>(numChannels) * 2);
 
     for (long i = 0; i < numChannels; ++i) {
         m_channelMemory[i * 2].assign(bufferSize, 0.0f);
@@ -265,39 +290,53 @@ ASIOError UniversalWasapiAsioDriver::createBuffers(
         m_activeChannels[i]       = bufferInfos[i];
     }
 
-    m_inputLatencyFrames  = m_activeBufferFrames;
-    m_outputLatencyFrames = m_activeBufferFrames + m_engineOverheadFrames;
-    m_buffersCreated      = true;
+    // O ASIO exige perguntar ao host antes de usar bufferSwitchTimeInfo
+    m_hostUsesTimeInfo = m_callbacks.bufferSwitchTimeInfo &&
+                         (!m_callbacks.bufferSwitch ||
+                          (m_callbacks.asioMessage && m_callbacks.asioMessage(kAsioSupportsTimeInfo, 0, nullptr, nullptr) == 1));
+
+    UpdateLatencyEstimate(bufferSize);
+    m_buffersCreated = true;
 
     long nIn = 0, nOut = 0;
     for (long i = 0; i < numChannels; ++i) (bufferInfos[i].isInput ? nIn : nOut)++;
-    NanoLog(L"createBuffers(): bloco=%ld | canais de ENTRADA ativados pelo Reaper=%ld | saida=%ld | taxa=%.0f Hz",
-            bufferSize, nIn, nOut, m_sampleRate);
+    NanoLog(L"createBuffers(): bloco=%ld | canais de ENTRADA ativados pela DAW=%ld | saida=%ld | taxa=%.0f Hz",
+            bufferSize, nIn, nOut, m_sampleRate.load());
     return ASE_OK;
 }
 
 ASIOError UniversalWasapiAsioDriver::disposeBuffers() {
+    // De dentro do bufferSwitch não dá para esperar a própria thread terminar
+    if (m_audioThread && GetCurrentThreadId() == m_audioThreadId) return ASE_InvalidMode;
     stop();
     m_activeChannels.clear();
     m_channelMemory.clear();
+    m_callbacks      = {};
     m_buffersCreated = false;
     return ASE_OK;
 }
 
 ASIOError UniversalWasapiAsioDriver::start() {
     if (!m_buffersCreated || m_running.load()) return ASE_InvalidMode;
+    if (m_audioThread && GetCurrentThreadId() == m_audioThreadId) return ASE_InvalidMode;
+    stop(); // recolhe uma thread encerrada por stop() chamado de dentro do bufferSwitch
 
     m_stopEvent   = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     m_renderEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (!m_stopEvent || !m_renderEvent) {
+    if (!m_outputReadyEvent) m_outputReadyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!m_stopEvent || !m_renderEvent || !m_outputReadyEvent) {
+        if (m_stopEvent)   { CloseHandle(m_stopEvent);   m_stopEvent   = nullptr; }
+        if (m_renderEvent) { CloseHandle(m_renderEvent); m_renderEvent = nullptr; }
         SetError("nanoAudio: Falha ao criar eventos de sincronizacao.");
         return ASE_HWMalfunction;
     }
 
     m_samplePosition.store(0);
+    m_hostUsesOutputReady.store(false);
+    m_streamConfig = m_config;
     m_running.store(true);
 
-    m_audioThread = CreateThread(nullptr, 0, &UniversalWasapiAsioDriver::AudioThreadProc, this, 0, nullptr);
+    m_audioThread = CreateThread(nullptr, 0, &UniversalWasapiAsioDriver::AudioThreadProc, this, 0, &m_audioThreadId);
     if (!m_audioThread) {
         m_running.store(false);
         CloseHandle(m_stopEvent);   m_stopEvent   = nullptr;
@@ -310,18 +349,24 @@ ASIOError UniversalWasapiAsioDriver::start() {
 }
 
 ASIOError UniversalWasapiAsioDriver::stop() {
-    if (!m_running.load()) return ASE_OK;
     m_running.store(false);
-
+    if (!m_audioThread) return ASE_OK;
     if (m_stopEvent) SetEvent(m_stopEvent);
-    if (m_audioThread) {
-        WaitForSingleObject(m_audioThread, 3000);
-        CloseHandle(m_audioThread);
-        m_audioThread = nullptr;
+    // Chamado de dentro do bufferSwitch: a thread sai sozinha e é recolhida depois
+    if (GetCurrentThreadId() == m_audioThreadId) return ASE_OK;
+
+    // Espera a thread terminar DE FATO: liberar os buffers com ela viva derrubaria a DAW.
+    // Enquanto espera, atende mensagens enviadas por ela (um SendMessage do bufferSwitch
+    // para a janela da DAW travaria os dois lados).
+    while (MsgWaitForMultipleObjectsEx(1, &m_audioThread, INFINITE, QS_SENDMESSAGE, MWMO_INPUTAVAILABLE) == WAIT_OBJECT_0 + 1) {
+        MSG msg;
+        PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
     }
+    CloseHandle(m_audioThread);
+    m_audioThread   = nullptr;
+    m_audioThreadId = 0;
     if (m_stopEvent)   { CloseHandle(m_stopEvent);   m_stopEvent   = nullptr; }
     if (m_renderEvent) { CloseHandle(m_renderEvent); m_renderEvent = nullptr; }
-
     return ASE_OK;
 }
 
@@ -334,8 +379,73 @@ ASIOError UniversalWasapiAsioDriver::future(long /*selector*/, void* /*opt*/) {
     return ASE_InvalidParameter;
 }
 
+// Hosts que processam fora do bufferSwitch avisam por aqui que o bloco de saída está pronto
 ASIOError UniversalWasapiAsioDriver::outputReady() {
+    if (m_running.load(std::memory_order_relaxed) && m_outputReadyEvent) {
+        m_hostUsesOutputReady.store(true, std::memory_order_relaxed);
+        SetEvent(m_outputReadyEvent);
+    }
     return ASE_OK;
+}
+
+bool UniversalWasapiAsioDriver::HostSupports(long selector) const {
+    return m_callbacks.asioMessage && m_callbacks.asioMessage(kAsioSelectorSupported, selector, nullptr, nullptr) == 1;
+}
+
+void UniversalWasapiAsioDriver::RequestHostReset() {
+    if (HostSupports(kAsioResetRequest)) m_callbacks.asioMessage(kAsioResetRequest, 0, nullptr, nullptr);
+}
+
+// Comportamento aprendido por dispositivo (em microssegundos), no Registro. Evita repetir a cada
+// abertura da DAW o estalo que ensinou que aquele driver precisa de mais folga, e permite informar a
+// latência certa já no createBuffers(), antes de o áudio rodar. Os limites impedem que um travamento
+// isolado do PC deixe a latência alta para sempre.
+struct DeviceTuning { const wchar_t* shared; const wchar_t* exclusive; LONG minUs, maxUs; };
+static const DeviceTuning kTuneBurst    = { L"SharedBurstUs",    L"ExclusiveBurstUs",         0,  21000 };
+static const DeviceTuning kTuneMargin   = { L"SharedMarginUs",   L"ExclusiveMarginUs",        0,  12000 };
+static const DeviceTuning kTuneOutExtra = { L"SharedOutExtraUs", L"ExclusiveOutExtraUs", -40000, 200000 };
+static const DeviceTuning kTuneInExtra  = { L"SharedInExtraUs",  L"ExclusiveInExtraUs",  -40000, 200000 };
+
+static std::wstring EndpointId(IMMDevice* dev) {
+    std::wstring id;
+    LPWSTR p = nullptr;
+    if (dev && SUCCEEDED(dev->GetId(&p)) && p) {
+        id = p;
+        CoTaskMemFree(p);
+    }
+    return id;
+}
+
+static std::wstring DeviceTuningKey(const std::wstring& id) {
+    return std::wstring(kUserSettingsKey) + L"\\Devices\\" + id;
+}
+
+// Retorna em frames (0 = nada aprendido)
+static long LoadDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double sampleRate) {
+    DWORD value = 0, size = sizeof(value);
+    if (id.empty() || RegGetValueW(HKEY_CURRENT_USER, DeviceTuningKey(id).c_str(), exclusive ? t.exclusive : t.shared,
+                                   RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS) return 0;
+    const LONG us = std::clamp(static_cast<LONG>(value), t.minUs, t.maxUs);
+    return static_cast<long>(us * sampleRate / 1e6);
+}
+
+static void SaveDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double frames, double sampleRate) {
+    HKEY h = nullptr;
+    if (id.empty() || RegCreateKeyExW(HKEY_CURRENT_USER, DeviceTuningKey(id).c_str(), 0, nullptr, 0, KEY_WRITE,
+                                      nullptr, &h, nullptr) != ERROR_SUCCESS) return;
+    const double us    = std::clamp(frames * 1e6 / sampleRate, static_cast<double>(t.minUs), static_cast<double>(t.maxUs));
+    const DWORD  value = static_cast<DWORD>(static_cast<LONG>(us));
+    RegSetValueExW(h, exclusive ? t.exclusive : t.shared, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(h);
+}
+
+// Latência a informar antes de abrir os streams: a prevista mais o que se mediu nesse dispositivo.
+void UniversalWasapiAsioDriver::UpdateLatencyEstimate(long blockFrames) {
+    const double rate      = m_sampleRate.load();
+    const bool   exclusive = m_config.useExclusiveMode;
+    const LatencyEstimate e = EstimateLatency(blockFrames, rate, exclusive);
+    m_inputLatencyFrames  = std::max(blockFrames, e.inputFrames  + LoadDeviceTuning(m_captureId, kTuneInExtra, exclusive, rate));
+    m_outputLatencyFrames = std::max(blockFrames, e.outputFrames + LoadDeviceTuning(m_renderId, kTuneOutExtra, exclusive, rate));
 }
 
 // ============================================================================
@@ -443,60 +553,30 @@ bool UniversalWasapiAsioDriver::ProbeHardwareCapabilities() {
     );
     if (FAILED(hr) || !pEnum) return false;
 
-    IMMDevice* pRender  = ResolveEndpoint(pEnum, eRender,  m_config.outputDeviceId, false, m_renderDeviceName, 128);
-    IMMDevice* pCapture = ResolveEndpoint(pEnum, eCapture, m_config.inputDeviceId,  true,  m_captureDeviceName, 128);
-
-    if (pRender) {
-        IAudioClient3* pClient3 = nullptr;
-        if (SUCCEEDED(pRender->Activate(__uuidof(IAudioClient3), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pClient3))) && pClient3) {
-            WAVEFORMATEX* pMixFormat = nullptr;
-            if (SUCCEEDED(pClient3->GetMixFormat(&pMixFormat)) && pMixFormat) {
-                m_nativeMixRate = static_cast<double>(pMixFormat->nSamplesPerSec);
-                // Não sobrescreve a taxa que o Reaper já definiu via setSampleRate()
-                if (!m_buffersCreated) {
-                    m_sampleRate = (m_config.preferredSampleRate > 0)
-                                       ? static_cast<double>(m_config.preferredSampleRate)
-                                       : m_nativeMixRate;
-                }
-                m_numOutputs    = std::max<long>(2, pMixFormat->nChannels);
-
-                UINT32 defaultPeriod = 0, fundamentalPeriod = 0, minPeriod = 0, maxPeriod = 0;
-                if (SUCCEEDED(pClient3->GetSharedModeEnginePeriod(
-                        pMixFormat, &defaultPeriod, &fundamentalPeriod, &minPeriod, &maxPeriod))) {
-                    // Com o Ring Buffer FIFO desacoplado, qualquer tamanho de bloco ASIO (32..2048)
-                    // é suportado independentemente do período interno do engine WASAPI.
-                    m_hwMinBufferFrames       = 32;
-                    m_hwPreferredBufferFrames = 256;
-                    m_hwMaxBufferFrames       = 2048;
-                    m_hwGranularityFrames     = 32;
-                    m_engineOverheadFrames    = static_cast<long>(minPeriod);
-                }
-                CoTaskMemFree(pMixFormat);
-            }
-            pClient3->Release();
+    auto probe = [](IMMDevice* dev, double* rate, long* channels) {
+        IAudioClient* client = nullptr;
+        if (FAILED(dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&client))) || !client) return;
+        WAVEFORMATEX* mix = nullptr;
+        if (SUCCEEDED(client->GetMixFormat(&mix)) && mix) {
+            if (rate) *rate = static_cast<double>(mix->nSamplesPerSec);
+            *channels = std::max<long>(2, mix->nChannels); // mono é aberto como estéreo
+            CoTaskMemFree(mix);
         }
+        client->Release();
+    };
+
+    wchar_t name[128] = {};
+    if (IMMDevice* pRender = ResolveEndpoint(pEnum, eRender, m_config.outputDeviceId, false, name, 128)) {
+        probe(pRender, &m_nativeMixRate, &m_numOutputs);
+        m_renderId = EndpointId(pRender);
         pRender->Release();
     }
-
-    if (pCapture) {
-        IAudioClient* pCapClient = nullptr;
-        if (SUCCEEDED(pCapture->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pCapClient))) && pCapClient) {
-            WAVEFORMATEX* pCapMix = nullptr;
-            if (SUCCEEDED(pCapClient->GetMixFormat(&pCapMix)) && pCapMix) {
-                m_hwCaptureChannels = std::max<long>(1, pCapMix->nChannels);
-                m_nativeCaptureRate = static_cast<double>(pCapMix->nSamplesPerSec);
-                m_numInputs         = std::max<long>(2, m_hwCaptureChannels);
-                CoTaskMemFree(pCapMix);
-            }
-            pCapClient->Release();
-        }
+    if (IMMDevice* pCapture = ResolveEndpoint(pEnum, eCapture, m_config.inputDeviceId, true, name, 128)) {
+        probe(pCapture, nullptr, &m_numInputs);
+        m_captureId = EndpointId(pCapture);
         pCapture->Release();
     }
-
     pEnum->Release();
-
-    m_inputLatencyFrames  = (m_config.customBufferFrames > 0) ? m_config.customBufferFrames : m_hwPreferredBufferFrames;
-    m_outputLatencyFrames = m_inputLatencyFrames + m_engineOverheadFrames;
     return true;
 }
 
@@ -522,8 +602,38 @@ interface IPolicyConfig : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE SetDeviceFormat(PCWSTR, WAVEFORMATEX*, WAVEFORMATEX*) = 0;
 };
 
+// Identificador do aparelho físico (entrada e saída da mesma mesa USB têm o mesmo)
+static const PROPERTYKEY kPkeyDeviceContainerId = {
+    { 0x8c7ed206, 0x3f8a, 0x4827, { 0xb3, 0xab, 0xae, 0x9e, 0x1f, 0xae, 0xfc, 0x6c } }, 2
+};
+
+static bool GetContainerId(IMMDevice* dev, GUID* out) {
+    bool ok = false;
+    IPropertyStore* props = nullptr;
+    if (SUCCEEDED(dev->OpenPropertyStore(STGM_READ, &props)) && props) {
+        PROPVARIANT v;
+        PropVariantInit(&v);
+        if (SUCCEEDED(props->GetValue(kPkeyDeviceContainerId, &v)) && v.vt == VT_CLSID && v.puuid) {
+            *out = *v.puuid;
+            ok = true;
+        }
+        PropVariantClear(&v);
+        props->Release();
+    }
+    return ok;
+}
+
+static bool IsSamePhysicalDevice(IMMDevice* a, IMMDevice* b) {
+    // {00000000-0000-0000-FFFF-FFFFFFFFFFFF} = "o próprio computador" (áudio da placa-mãe)
+    static const GUID kThisPc = { 0, 0, 0, { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } };
+    GUID ga, gb;
+    return GetContainerId(a, &ga) && GetContainerId(b, &gb) && IsEqualGUID(ga, gb) && !IsEqualGUID(ga, kThisPc);
+}
+
+// Só mexe no formato do Windows quando é preciso: entrada e saída do MESMO aparelho em taxas
+// diferentes. Com aparelhos distintos cada um tem o próprio clock e não há conflito.
 static void SyncEndpointSampleRates(IMMDevice* pRender, IMMDevice* pCapture) {
-    if (!pRender || !pCapture) return;
+    if (!pRender || !pCapture || !IsSamePhysicalDevice(pRender, pCapture)) return;
     LPWSTR renId = nullptr, capId = nullptr;
     pRender->GetId(&renId);
     pCapture->GetId(&capId);
@@ -551,12 +661,419 @@ static void SyncEndpointSampleRates(IMMDevice* pRender, IMMDevice* pCapture) {
     if (capId) CoTaskMemFree(capId);
 }
 
+// Sessão de áudio própria do driver: o controle "por aplicativo" do Windows para a DAW em
+// outros modos (WASAPI, DirectSound) não interfere aqui, e vice-versa.
+static const GUID kAudioSessionGuid = {
+    0x3b7c1d52, 0x9e44, 0x4c0a, { 0x8d, 0x21, 0x5f, 0x6a, 0x90, 0xe3, 0x7b, 0x14 }
+};
+static const GUID kSubtypePcm   = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kSubtypeFloat = { 0x00000003, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+
+template <class T> static void SafeRelease(T*& p) {
+    if (p) { p->Release(); p = nullptr; }
+}
+
+// Int32 também cobre "24 bits válidos em 32" (alinhados no bit mais significativo).
+enum class SampleKind { Float32, Int16, Int24, Int32 };
+
+static const wchar_t* SampleKindName(SampleKind k) {
+    switch (k) {
+        case SampleKind::Int16: return L"16-bit";
+        case SampleKind::Int24: return L"24-bit";
+        case SampleKind::Int32: return L"32-bit";
+        default:                return L"float";
+    }
+}
+
+static bool SampleKindOf(const WAVEFORMATEX* w, SampleKind* kind) {
+    WORD tag = w->wFormatTag;
+    if (tag == WAVE_FORMAT_EXTENSIBLE && w->cbSize >= 22) {
+        tag = static_cast<WORD>(reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(w)->SubFormat.Data1);
+    }
+    if (tag == WAVE_FORMAT_IEEE_FLOAT && w->wBitsPerSample == 32) { *kind = SampleKind::Float32; return true; }
+    if (tag != WAVE_FORMAT_PCM) return false;
+    if (w->wBitsPerSample == 16) { *kind = SampleKind::Int16; return true; }
+    if (w->wBitsPerSample == 24) { *kind = SampleKind::Int24; return true; }
+    if (w->wBitsPerSample == 32) { *kind = SampleKind::Int32; return true; }
+    return false;
+}
+
+// Lê um canal intercalado para float. Retorna o pico.
+static float LoadChannel(const BYTE* src, size_t stride, SampleKind kind, float* dst, size_t n) {
+    switch (kind) {
+        case SampleKind::Float32:
+            for (size_t i = 0; i < n; ++i, src += stride) std::memcpy(&dst[i], src, 4);
+            break;
+        case SampleKind::Int16:
+            for (size_t i = 0; i < n; ++i, src += stride) {
+                int16_t v;
+                std::memcpy(&v, src, 2);
+                dst[i] = static_cast<float>(v) * (1.0f / 32768.0f);
+            }
+            break;
+        case SampleKind::Int24:
+            for (size_t i = 0; i < n; ++i, src += stride) {
+                const int32_t v = static_cast<int32_t>((static_cast<uint32_t>(src[0]) << 8) |
+                                                       (static_cast<uint32_t>(src[1]) << 16) |
+                                                       (static_cast<uint32_t>(src[2]) << 24));
+                dst[i] = static_cast<float>(v >> 8) * (1.0f / 8388608.0f);
+            }
+            break;
+        case SampleKind::Int32:
+            for (size_t i = 0; i < n; ++i, src += stride) {
+                int32_t v;
+                std::memcpy(&v, src, 4);
+                dst[i] = static_cast<float>(v) * (1.0f / 2147483648.0f);
+            }
+            break;
+    }
+    float peak = 0.0f;
+    for (size_t i = 0; i < n; ++i) peak = std::max(peak, std::fabs(dst[i]));
+    return peak;
+}
+
+// Grava um canal float no formato do dispositivo, com ganho em rampa (g0 -> g1) ao longo do bloco.
+static void StoreChannel(BYTE* dst, size_t stride, SampleKind kind, const float* src, size_t n, float g0, float g1) {
+    const float dg = (g1 - g0) / static_cast<float>(n);
+    float g = g0;
+    switch (kind) {
+        case SampleKind::Float32:
+            // Sem corte em 0 dBFS: o ganho de compensação é desfeito pelo volume do Windows
+            for (size_t i = 0; i < n; ++i, dst += stride) {
+                g += dg;
+                const float v = src[i] * g;
+                std::memcpy(dst, &v, 4);
+            }
+            break;
+        case SampleKind::Int16:
+            for (size_t i = 0; i < n; ++i, dst += stride) {
+                g += dg;
+                const int16_t v = static_cast<int16_t>(std::lrint(std::clamp(src[i] * g * 32768.0f, -32768.0f, 32767.0f)));
+                std::memcpy(dst, &v, 2);
+            }
+            break;
+        case SampleKind::Int24:
+            for (size_t i = 0; i < n; ++i, dst += stride) {
+                g += dg;
+                const int32_t v = static_cast<int32_t>(std::lrint(std::clamp(src[i] * g * 8388608.0f, -8388608.0f, 8388607.0f)));
+                dst[0] = static_cast<BYTE>(v);
+                dst[1] = static_cast<BYTE>(v >> 8);
+                dst[2] = static_cast<BYTE>(v >> 16);
+            }
+            break;
+        case SampleKind::Int32:
+            for (size_t i = 0; i < n; ++i, dst += stride) {
+                g += dg;
+                // 2147483520 = maior float que cabe em int32
+                const int32_t v = static_cast<int32_t>(std::lrint(std::clamp(src[i] * g * 2147483648.0f, -2147483648.0f, 2147483520.0f)));
+                std::memcpy(dst, &v, 4);
+            }
+            break;
+    }
+}
+
+struct RenderStream {
+    IAudioClient*       client       = nullptr;
+    IAudioRenderClient* service      = nullptr;
+    SampleKind          kind         = SampleKind::Float32;
+    long                channels     = 2;
+    long                blockAlign   = 8;
+    UINT32              bufferFrames = 0;
+    long                periodFrames = 480;
+    bool                exclusive    = false;
+    bool                usesEvent    = false;
+    HRESULT             hr           = E_FAIL;
+
+    void Close() {
+        SafeRelease(service);
+        SafeRelease(client);
+        usesEvent = false;
+    }
+};
+
+struct CaptureStream {
+    IAudioClient*        client     = nullptr;
+    IAudioCaptureClient* service    = nullptr;
+    SampleKind           kind       = SampleKind::Float32;
+    long                 channels   = 2;
+    long                 blockAlign = 8;
+    UINT32               bufferFrames = 0;
+    double               rate       = 48000.0;
+    bool                 exclusive  = false;
+    HRESULT              hr         = E_FAIL;
+
+    void Close() {
+        SafeRelease(service);
+        SafeRelease(client);
+    }
+};
+
+static HRESULT ActivateClient(IMMDevice* dev, IAudioClient** client) {
+    *client = nullptr;
+    const HRESULT hr = dev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(client));
+    return (SUCCEEDED(hr) && !*client) ? E_FAIL : hr;
+}
+
+// Formato do mixer do dispositivo (canais e máscara). Se falhar, assume estéreo.
+static void GetMixLayout(IMMDevice* dev, WORD* channels, DWORD* mask) {
+    *channels = 2;
+    *mask     = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    IAudioClient* client = nullptr;
+    if (FAILED(ActivateClient(dev, &client))) return;
+    WAVEFORMATEX* mix = nullptr;
+    if (SUCCEEDED(client->GetMixFormat(&mix)) && mix) {
+        *channels = std::max<WORD>(1, mix->nChannels);
+        if (mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE && mix->cbSize >= 22) {
+            *mask = reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(mix)->dwChannelMask;
+        } else if (mix->nChannels != 2) {
+            *mask = 0;
+        }
+        CoTaskMemFree(mix);
+    }
+    client->Release();
+}
+
+static WAVEFORMATEXTENSIBLE MakeFormat(WORD channels, DWORD mask, DWORD rate, WORD container, WORD valid, bool isFloat, bool extensible) {
+    WAVEFORMATEXTENSIBLE w = {};
+    w.Format.wFormatTag      = extensible ? WAVE_FORMAT_EXTENSIBLE
+                                          : static_cast<WORD>(isFloat ? WAVE_FORMAT_IEEE_FLOAT : WAVE_FORMAT_PCM);
+    w.Format.nChannels       = channels;
+    w.Format.nSamplesPerSec  = rate;
+    w.Format.wBitsPerSample  = container;
+    w.Format.nBlockAlign     = static_cast<WORD>(channels * (container / 8));
+    w.Format.nAvgBytesPerSec = rate * w.Format.nBlockAlign;
+    if (extensible) {
+        w.Format.cbSize               = sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX);
+        w.Samples.wValidBitsPerSample = valid;
+        w.dwChannelMask               = mask;
+        w.SubFormat                   = isFloat ? kSubtypeFloat : kSubtypePcm;
+    }
+    return w;
+}
+
+// Modo exclusivo: tenta os formatos na ordem da resolução escolhida no painel.
+static HRESULT InitExclusive(IMMDevice* dev, DWORD rate, long bitDepth, REFERENCE_TIME bufferDur,
+                             IAudioClient** outClient, SampleKind* kind, long* channels, long* blockAlign) {
+    struct Fmt { WORD container, valid; };
+    static const Fmt kOrder32[4] = { {32, 32}, {32, 24}, {24, 24}, {16, 16} };
+    static const Fmt kOrder24[4] = { {32, 24}, {24, 24}, {32, 32}, {16, 16} };
+    static const Fmt kOrder16[4] = { {16, 16}, {32, 24}, {24, 24}, {32, 32} };
+    const Fmt* order = (bitDepth == 16) ? kOrder16 : (bitDepth == 24) ? kOrder24 : kOrder32;
+
+    WORD  mixChannels = 2;
+    DWORD mixMask     = 0;
+    GetMixLayout(dev, &mixChannels, &mixMask);
+
+    HRESULT last = AUDCLNT_E_UNSUPPORTED_FORMAT;
+    for (int i = 0; i < 4; ++i) {
+        for (int ext = 1; ext >= 0; --ext) {
+            if (!ext && order[i].container != order[i].valid) continue;
+            const WAVEFORMATEXTENSIBLE w = MakeFormat(mixChannels, mixMask, rate, order[i].container, order[i].valid, false, ext == 1);
+
+            IAudioClient* client = nullptr;
+            HRESULT hr = ActivateClient(dev, &client);
+            if (FAILED(hr)) return hr;
+            hr = client->IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, &w.Format, nullptr);
+            if (hr != S_OK) {
+                client->Release();
+                if (hr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED || hr == AUDCLNT_E_DEVICE_IN_USE) return hr;
+                continue;
+            }
+            REFERENCE_TIME defPeriod = 0, minPeriod = 0;
+            client->GetDevicePeriod(&defPeriod, &minPeriod);
+            hr = client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, bufferDur, minPeriod, &w.Format, nullptr);
+            if (hr == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED) {
+                UINT32 frames = 0;
+                client->GetBufferSize(&frames);
+                client->Release();
+                hr = ActivateClient(dev, &client);
+                if (FAILED(hr)) return hr;
+                const REFERENCE_TIME aligned = static_cast<REFERENCE_TIME>(10000000.0 * frames / rate + 0.5);
+                hr = client->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, aligned, minPeriod, &w.Format, nullptr);
+            }
+            if (SUCCEEDED(hr)) {
+                *outClient  = client;
+                *channels   = w.Format.nChannels;
+                *blockAlign = w.Format.nBlockAlign;
+                SampleKindOf(&w.Format, kind);
+                return hr;
+            }
+            client->Release();
+            last = hr;
+            if (hr == AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED || hr == AUDCLNT_E_DEVICE_IN_USE) return hr;
+        }
+    }
+    return last;
+}
+
+static bool FinishRender(RenderStream& rs, long blockFrames) {
+    if (SUCCEEDED(rs.hr)) rs.hr = rs.client->GetBufferSize(&rs.bufferFrames);
+    if (SUCCEEDED(rs.hr)) rs.hr = rs.client->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&rs.service));
+    if (SUCCEEDED(rs.hr) && rs.bufferFrames < static_cast<UINT32>(blockFrames)) rs.hr = AUDCLNT_E_BUFFER_SIZE_ERROR;
+    if (SUCCEEDED(rs.hr)) return true;
+    rs.Close();
+    return false;
+}
+
+// Saída exclusiva por tempo (sem evento): o mesmo loop por "padding" do modo compartilhado serve
+// para os dois, e funciona em drivers que não suportam eventos no modo exclusivo.
+static bool OpenRenderExclusive(IMMDevice* dev, double rate, long blockFrames, long bitDepth, RenderStream& rs) {
+    const REFERENCE_TIME dur = static_cast<REFERENCE_TIME>(10000000.0 * (blockFrames * 2 + rate * 0.030) / rate + 0.5);
+    rs.hr = InitExclusive(dev, static_cast<DWORD>(rate), bitDepth, dur, &rs.client, &rs.kind, &rs.channels, &rs.blockAlign);
+    if (FAILED(rs.hr)) return false;
+    rs.exclusive    = true;
+    rs.periodFrames = static_cast<long>(rate * 0.010 + 0.5);
+    return FinishRender(rs, blockFrames);
+}
+
+// Saída compartilhada: float 32-bit; o Windows converte taxa e canais se preciso.
+static bool OpenRenderShared(IMMDevice* dev, double rate, long blockFrames, HANDLE hEvent, RenderStream& rs) {
+    WORD  channels = 2;
+    DWORD mask     = 0;
+    GetMixLayout(dev, &channels, &mask);
+    if (channels < 2) { channels = 2; mask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT; } // o Windows soma em mono
+
+    for (int attempt = 0; attempt < 2; ++attempt) { // 0 = por evento, 1 = por tempo
+        rs.Close();
+        // Um IAudioClient que falhou no Initialize não pode ser reutilizado: cria um novo.
+        rs.hr = ActivateClient(dev, &rs.client);
+        if (FAILED(rs.hr)) return false;
+
+        const WAVEFORMATEXTENSIBLE fmt = MakeFormat(channels, mask, static_cast<DWORD>(rate), 32, 32, true, channels > 2);
+        REFERENCE_TIME defPeriod = 100000;
+        rs.client->GetDevicePeriod(&defPeriod, nullptr);
+        rs.periodFrames = std::max<long>(1, static_cast<long>(std::ceil(static_cast<double>(defPeriod) * rate / 1e7)));
+
+        // Espaço para o alvo crescer se o PC não acompanhar (ver "targetFill" no loop)
+        const double frames = std::max<double>(blockFrames * 3.0, 1024.0) + rs.periodFrames * 2.0;
+        DWORD flags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY | AUDCLNT_STREAMFLAGS_NOPERSIST;
+        if (attempt == 0) flags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+        rs.hr = rs.client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, static_cast<REFERENCE_TIME>(1e7 * frames / rate + 0.5), 0,
+                                      &fmt.Format, &kAudioSessionGuid);
+        if (SUCCEEDED(rs.hr) && attempt == 0) rs.hr = rs.client->SetEventHandle(hEvent);
+        if (FAILED(rs.hr)) continue;
+
+        rs.kind       = SampleKind::Float32;
+        rs.channels   = channels;
+        rs.blockAlign = fmt.Format.nBlockAlign;
+        rs.exclusive  = false;
+        rs.usesEvent  = (attempt == 0);
+        if (FinishRender(rs, blockFrames)) return true;
+    }
+    rs.Close();
+    return false;
+}
+
+// Abre a entrada (sem iniciar).
+static bool OpenCapture(IMMDevice* dev, double rate, long blockFrames, bool exclusive, long bitDepth, CaptureStream& cs) {
+    WORD  channels = 2;
+    DWORD mask     = 0;
+    GetMixLayout(dev, &channels, &mask);
+    // Em tempo, não em frames: 2048 frames a 96 kHz são 21 ms, menos que o intervalo entre as rajadas
+    // de alguns drivers USB (~23 ms), e o Windows perdia áudio. Buffer maior não aumenta a latência.
+    const REFERENCE_TIME blockDur  = static_cast<REFERENCE_TIME>(1e7 * blockFrames * 4 / rate);
+    const REFERENCE_TIME dur       = std::max<REFERENCE_TIME>(blockDur, 1000000);  // 100 ms
+    const REFERENCE_TIME durExclus = std::max<REFERENCE_TIME>(blockDur, 500000);   //  50 ms
+
+    // Cada tentativa usa um IAudioClient novo (um cliente que falhou não pode ser reinicializado)
+    auto tryShared = [&](const WAVEFORMATEX* fmt, DWORD flags) -> bool {
+        cs.Close();
+        cs.hr = ActivateClient(dev, &cs.client);
+        if (SUCCEEDED(cs.hr)) cs.hr = cs.client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, dur, 0, fmt, nullptr);
+        if (FAILED(cs.hr) || !SampleKindOf(fmt, &cs.kind)) {
+            if (SUCCEEDED(cs.hr)) cs.hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+            cs.Close();
+            return false;
+        }
+        cs.channels   = fmt->nChannels;
+        cs.blockAlign = fmt->nBlockAlign;
+        cs.rate       = static_cast<double>(fmt->nSamplesPerSec);
+        cs.exclusive  = false;
+        return true;
+    };
+    auto tryExclusive = [&](double r, long bits) -> bool {
+        cs.Close();
+        cs.hr = InitExclusive(dev, static_cast<DWORD>(r), bits, durExclus, &cs.client, &cs.kind, &cs.channels, &cs.blockAlign);
+        if (FAILED(cs.hr)) return false;
+        cs.rate      = r;
+        cs.exclusive = true;
+        return true;
+    };
+
+    bool opened = false;
+    if (exclusive) {
+        opened = tryExclusive(rate, bitDepth);
+        if (!opened) NanoLog(L"Entrada exclusiva indisponivel (hr=0x%08lX). Usando modo compartilhado.", static_cast<unsigned long>(cs.hr));
+    }
+
+    // Tentativa A: float 32-bit na taxa do ASIO, com conversão automática do Windows
+    const DWORD autoFlags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+    if (!opened) {
+        const WAVEFORMATEXTENSIBLE fmt = MakeFormat(channels, mask, static_cast<DWORD>(rate), 32, 32, true, channels > 2);
+        opened = tryShared(&fmt.Format, autoFlags);
+        if (!opened && channels != 2) {
+            const WAVEFORMATEXTENSIBLE stereo = MakeFormat(2, 0, static_cast<DWORD>(rate), 32, 32, true, false);
+            opened = tryShared(&stereo.Format, autoFlags);
+        }
+    }
+
+    // Tentativa B: formato nativo da mesa (sem conversão do Windows) + conversor de taxa do FIFO
+    if (!opened) {
+        NanoLog(L"Tentativa A falhou (hr=0x%08lX). Abrindo a entrada no formato nativo...", static_cast<unsigned long>(cs.hr));
+        IAudioClient* probe = nullptr;
+        WAVEFORMATEX* mix   = nullptr;
+        if (SUCCEEDED(ActivateClient(dev, &probe))) {
+            probe->GetMixFormat(&mix);
+            probe->Release();
+        }
+        if (mix) {
+            opened = tryShared(mix, 0);
+            CoTaskMemFree(mix);
+        }
+    }
+
+    // Tentativa C: exclusivo 16-bit (caso o driver WDM USB 1.1, como o Behringer 2.8.40, recuse o
+    // modo compartilhado com 0x8889000F)
+    if (!opened) {
+        opened = tryExclusive(rate, 16) || tryExclusive(rate == 44100.0 ? 48000.0 : 44100.0, 16);
+        if (opened) NanoLog(L"Tentativa C (Exclusivo %.0f Hz) abriu com sucesso!", cs.rate);
+    }
+
+    if (opened) cs.hr = cs.client->GetBufferSize(&cs.bufferFrames);
+    if (opened && SUCCEEDED(cs.hr)) cs.hr = cs.client->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&cs.service));
+    if (!opened || FAILED(cs.hr)) {
+        cs.Close();
+        return false;
+    }
+    return true;
+}
+
+// Deixa o stream em 100% no Mixer de Volume e fora da "atenuação durante chamadas" do Windows.
+static void SetupRenderSession(IAudioClient* client, bool fullVolume) {
+    IAudioSessionControl* control = nullptr;
+    if (SUCCEEDED(client->GetService(__uuidof(IAudioSessionControl), reinterpret_cast<void**>(&control))) && control) {
+        IAudioSessionControl2* control2 = nullptr;
+        if (SUCCEEDED(control->QueryInterface(__uuidof(IAudioSessionControl2), reinterpret_cast<void**>(&control2))) && control2) {
+            control2->SetDuckingPreference(TRUE); // TRUE = não participar da atenuação
+            control2->Release();
+        }
+        control->Release();
+    }
+    if (!fullVolume) return;
+    ISimpleAudioVolume* volume = nullptr;
+    if (SUCCEEDED(client->GetService(__uuidof(ISimpleAudioVolume), reinterpret_cast<void**>(&volume))) && volume) {
+        volume->SetMasterVolume(1.0f, nullptr);
+        volume->SetMute(FALSE, nullptr);
+        volume->Release();
+    }
+}
+
 DWORD WINAPI UniversalWasapiAsioDriver::AudioThreadProc(LPVOID param) {
     return static_cast<UniversalWasapiAsioDriver*>(param)->RunRealTimeAudioLoop();
 }
 
 DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
-    HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    const HRESULT hrCom = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     timeBeginPeriod(1);
 
     DWORD mmcssTaskIndex = 0;
@@ -564,383 +1081,350 @@ DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
     if (hMmcss) {
         AvSetMmThreadPriority(hMmcss, AVRT_PRIORITY_CRITICAL);
     }
+    _mm_setcsr(_mm_getcsr() | 0x8040); // FTZ + DAZ: números denormais custam caro na CPU
 
-    // Cópia local dos parâmetros: o Painel de Controle pode alterar m_numInputs / m_config
-    // em outra thread enquanto o áudio roda (evita estouro de buffer por condição de corrida).
-    const long   blockFrames = std::max<long>(16, m_activeBufferFrames);
-    const double sampleRate  = (m_sampleRate > 1000.0) ? m_sampleRate : 48000.0;
-    const long   numIn       = std::max<long>(1, m_numInputs);
-    const bool   wantInput   = m_config.enableInputCapture;
-    wchar_t inputId[256]  = {};
-    wchar_t outputId[256] = {};
-    std::wcsncpy(inputId,  m_config.inputDeviceId,  255);
-    std::wcsncpy(outputId, m_config.outputDeviceId, 255);
+    // Cópia local dos parâmetros (m_streamConfig foi copiado no start()): o Painel de Controle pode
+    // alterar m_config em outra thread enquanto o áudio roda.
+    const long             blockFrames = m_activeBufferFrames;
+    const double           sampleRate  = (m_sampleRate.load() > 1000.0) ? m_sampleRate.load() : 48000.0;
+    const DriverUserConfig cfg         = m_streamConfig;
 
-    NanoLog(L"==== start(): bloco=%ld frames | taxa ASIO=%.0f Hz | entradas ASIO=%ld | captura=%ls",
-            blockFrames, sampleRate, numIn, wantInput ? L"LIGADA" : L"DESLIGADA");
+    long numIn = 0;
+    for (const ASIOBufferInfo& bi : m_activeChannels) {
+        if (bi.isInput) numIn = std::max(numIn, bi.channelNum + 1);
+    }
+    // Sem canal de entrada ativo na DAW não há por que abrir o microfone
+    const bool wantInput = cfg.enableInputCapture && numIn > 0;
+
+    NanoLog(L"==== start(): bloco=%ld frames | taxa ASIO=%.0f Hz | entradas ASIO=%ld | captura=%ls | modo=%ls",
+            blockFrames, sampleRate, numIn, wantInput ? L"LIGADA" : L"DESLIGADA",
+            cfg.useExclusiveMode ? L"exclusivo" : L"compartilhado");
 
     // Cria o enumerador e os endpoints dentro da thread MTA (evita falha de marshaling COM STA->MTA)
-    IMMDeviceEnumerator* pEnum           = nullptr;
-    IMMDevice*           pRenderDevice   = nullptr;
-    IMMDevice*           pCaptureDevice  = nullptr;
-    IAudioClient*        pRenderClient   = nullptr;
-    IAudioRenderClient*  pRenderService  = nullptr;
-    IAudioClient*        pCaptureClient  = nullptr;
-    IAudioCaptureClient* pCaptureService = nullptr;
-
-    HRESULT hr = CoCreateInstance(
-        __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-        __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum)
-    );
-    if (SUCCEEDED(hr) && pEnum) {
-        pRenderDevice  = ResolveEndpoint(pEnum, eRender,  outputId, false, m_renderDeviceName, 128);
-        pCaptureDevice = ResolveEndpoint(pEnum, eCapture, inputId,  true,  m_captureDeviceName, 128);
-        SyncEndpointSampleRates(pRenderDevice, pCaptureDevice);
-    }
-    NanoLog(L"Saida escolhida: %ls | Entrada escolhida: %ls",
-            pRenderDevice  ? m_renderDeviceName  : L"(nenhuma)",
-            pCaptureDevice ? m_captureDeviceName : L"(nenhuma)");
-
-    // ------------------------------------------------------------------------
-    // 1. STREAM DE SAÍDA (Render) — float 32-bit + AutoConvertPCM
-    // ------------------------------------------------------------------------
-    long    renderChannels   = 2;
-    bool    renderUsesEvent  = false;
-    bool    renderOk         = false;
-    UINT32  renderBufferSize = 0;
-    HRESULT hrRender         = E_FAIL;
-
-    if (pRenderDevice && SUCCEEDED(pRenderDevice->Activate(
-            __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pRenderClient))) && pRenderClient) {
-
-        WAVEFORMATEX* pMix = nullptr;
-        if (SUCCEEDED(pRenderClient->GetMixFormat(&pMix)) && pMix) {
-            renderChannels = std::max<long>(1, pMix->nChannels);
-            CoTaskMemFree(pMix);
-        }
-
-        WAVEFORMATEX wfxOut = {};
-        wfxOut.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-        wfxOut.nChannels       = static_cast<WORD>(renderChannels);
-        wfxOut.nSamplesPerSec  = static_cast<DWORD>(sampleRate);
-        wfxOut.wBitsPerSample  = 32;
-        wfxOut.nBlockAlign     = static_cast<WORD>((wfxOut.nChannels * 32) / 8);
-        wfxOut.nAvgBytesPerSec = wfxOut.nSamplesPerSec * wfxOut.nBlockAlign;
-        wfxOut.cbSize          = 0;
-
-        const REFERENCE_TIME renderDur = static_cast<REFERENCE_TIME>(
-            (10000000.0 * std::max<long>(blockFrames * 3, 1024)) / sampleRate + 0.5);
-
-        hrRender = pRenderClient->Initialize(
-            AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-            renderDur, 0, &wfxOut, nullptr);
-
-        if (SUCCEEDED(hrRender)) {
-            renderUsesEvent = SUCCEEDED(pRenderClient->SetEventHandle(m_renderEvent));
-        } else {
-            // Um IAudioClient que falhou no Initialize não deve ser reutilizado: cria um novo.
-            pRenderClient->Release();
-            pRenderClient = nullptr;
-            if (SUCCEEDED(pRenderDevice->Activate(
-                    __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pRenderClient))) && pRenderClient) {
-                hrRender = pRenderClient->Initialize(
-                    AUDCLNT_SHAREMODE_SHARED,
-                    AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
-                    renderDur, 0, &wfxOut, nullptr);
-            }
-        }
-
-        if (SUCCEEDED(hrRender) && pRenderClient &&
-            SUCCEEDED(pRenderClient->GetService(__uuidof(IAudioRenderClient), reinterpret_cast<void**>(&pRenderService))) &&
-            pRenderService &&
-            SUCCEEDED(pRenderClient->GetBufferSize(&renderBufferSize)) &&
-            renderBufferSize >= static_cast<UINT32>(blockFrames)) {
-            renderOk = true;
+    IMMDeviceEnumerator* pEnum          = nullptr;
+    IMMDevice*           pRenderDevice  = nullptr;
+    IMMDevice*           pCaptureDevice = nullptr;
+    wchar_t renderName[128] = L"(nenhuma)", captureName[128] = L"(nenhuma)";
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                   __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum))) && pEnum) {
+        pRenderDevice = ResolveEndpoint(pEnum, eRender, cfg.outputDeviceId, false, renderName, 128);
+        if (wantInput) {
+            pCaptureDevice = ResolveEndpoint(pEnum, eCapture, cfg.inputDeviceId, true, captureName, 128);
+            if (!cfg.useExclusiveMode) SyncEndpointSampleRates(pRenderDevice, pCaptureDevice);
         }
     }
-    NanoLog(L"Saida WASAPI: hr=0x%08lX | canais=%ld | buffer=%u frames | evento=%ls | OK=%ls",
-            static_cast<unsigned long>(hrRender), renderChannels, renderBufferSize,
-            renderUsesEvent ? L"sim" : L"nao", renderOk ? L"SIM" : L"NAO (usando relogio interno)");
+    NanoLog(L"Saida escolhida: %ls | Entrada escolhida: %ls", renderName, captureName);
+
+    // ------------------------------------------------------------------------
+    // 1. STREAM DE SAÍDA (Render)
+    // ------------------------------------------------------------------------
+    RenderStream rs;
+    bool renderOk = false;
+    if (pRenderDevice) {
+        if (cfg.useExclusiveMode) {
+            renderOk = OpenRenderExclusive(pRenderDevice, sampleRate, blockFrames, cfg.bitDepth, rs);
+            if (!renderOk) NanoLog(L"Saida exclusiva indisponivel (hr=0x%08lX). Usando modo compartilhado.", static_cast<unsigned long>(rs.hr));
+        }
+        if (!renderOk) renderOk = OpenRenderShared(pRenderDevice, sampleRate, blockFrames, m_renderEvent, rs);
+    }
+    NanoLog(L"Saida WASAPI: hr=0x%08lX | %ls %ls | canais=%ld | buffer=%u frames | evento=%ls | OK=%ls",
+            static_cast<unsigned long>(rs.hr), rs.exclusive ? L"exclusivo" : L"compartilhado", SampleKindName(rs.kind),
+            rs.channels, rs.bufferFrames, rs.usesEvent ? L"sim" : L"nao", renderOk ? L"SIM" : L"NAO (usando relogio interno)");
+
+    nanoAudioVolume::Compensator volume;
+    if (renderOk && !rs.exclusive) {
+        SetupRenderSession(rs.client, cfg.ignoreWindowsVolume);
+        const nanoAudioVolume::EndpointVolume ev = nanoAudioVolume::Query(pRenderDevice);
+        const bool compensating = cfg.ignoreWindowsVolume && volume.Start(pRenderDevice, rs.channels);
+        NanoLog(L"Volume do Windows na saida: %.0f%% (%.1f dB, %ls%ls) | compensacao=%ls (%+.1f dB)",
+                ev.scalar * 100.0f, ev.db, ev.software ? L"por software" : L"no hardware", ev.muted ? L", MUDO" : L"",
+                compensating ? L"LIGADA" : L"desligada", 20.0f * std::log10(volume.Gain(0)));
+    }
 
     // ------------------------------------------------------------------------
     // 2. STREAM DE CAPTURA (Mesa de Som USB / Microfone)
     // ------------------------------------------------------------------------
-    long    capChannels       = 2;
-    double  capRate           = sampleRate;
-    bool    capIsFloat        = true;
-    UINT    capBytesPerSample = 4;
-    UINT    capBlockAlign     = 8;
-    HRESULT hrCapture         = E_FAIL;
-    m_captureStreamActive.store(false);
-
-    if (wantInput && pCaptureDevice) {
-        WAVEFORMATEX* pCapMix = nullptr;
-        {
-            IAudioClient* pProbe = nullptr;
-            if (SUCCEEDED(pCaptureDevice->Activate(
-                    __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pProbe))) && pProbe) {
-                pProbe->GetMixFormat(&pCapMix);
-                pProbe->Release();
-            }
-        }
-        if (pCapMix) {
-            capChannels = std::max<long>(1, pCapMix->nChannels);
-            NanoLog(L"Formato nativo da entrada: %lu Hz | %u canais | %u bits | tag=0x%04X",
-                    static_cast<unsigned long>(pCapMix->nSamplesPerSec), pCapMix->nChannels,
-                    pCapMix->wBitsPerSample, pCapMix->wFormatTag);
-        }
-
-        const REFERENCE_TIME capDur = static_cast<REFERENCE_TIME>(
-            (10000000.0 * std::max<long>(blockFrames * 4, 2048)) / sampleRate + 0.5);
-
-        // Cada tentativa usa um IAudioClient novo (um cliente que falhou não pode ser reinicializado)
-        auto tryInitCapture = [&](const WAVEFORMATEX* fmt, DWORD flags) -> HRESULT {
-            if (pCaptureClient) { pCaptureClient->Release(); pCaptureClient = nullptr; }
-            HRESULT h = pCaptureDevice->Activate(
-                __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pCaptureClient));
-            if (FAILED(h) || !pCaptureClient) return FAILED(h) ? h : E_FAIL;
-            return pCaptureClient->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, capDur, 0, fmt, nullptr);
-        };
-
-        // Tentativa A: float 32-bit na taxa do ASIO, com conversão automática do Windows
-        WAVEFORMATEX wfxIn = {};
-        wfxIn.wFormatTag      = WAVE_FORMAT_IEEE_FLOAT;
-        wfxIn.nChannels       = static_cast<WORD>(capChannels);
-        wfxIn.nSamplesPerSec  = static_cast<DWORD>(sampleRate);
-        wfxIn.wBitsPerSample  = 32;
-        wfxIn.nBlockAlign     = static_cast<WORD>(wfxIn.nChannels * 4);
-        wfxIn.nAvgBytesPerSec = wfxIn.nSamplesPerSec * wfxIn.nBlockAlign;
-        wfxIn.cbSize          = 0;
-
-        const DWORD autoFlags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
-        hrCapture = tryInitCapture(&wfxIn, autoFlags);
-        if (FAILED(hrCapture) && wfxIn.nChannels != 2) {
-            wfxIn.nChannels       = 2;
-            wfxIn.nBlockAlign     = 8;
-            wfxIn.nAvgBytesPerSec = wfxIn.nSamplesPerSec * 8;
-            hrCapture = tryInitCapture(&wfxIn, autoFlags);
-        }
-        if (SUCCEEDED(hrCapture)) {
-            capChannels       = wfxIn.nChannels;
-            capRate           = sampleRate;
-            capIsFloat        = true;
-            capBytesPerSample = 4;
-            capBlockAlign     = wfxIn.nBlockAlign;
-        }
-
-        // Tentativa B: formato nativo da mesa (sem conversão do Windows) + conversor de taxa interno
-        if (FAILED(hrCapture) && pCapMix) {
-            NanoLog(L"Tentativa A falhou (hr=0x%08lX). Abrindo a entrada no formato nativo...",
-                    static_cast<unsigned long>(hrCapture));
-            hrCapture = tryInitCapture(pCapMix, 0);
-            if (SUCCEEDED(hrCapture)) {
-                capChannels       = std::max<long>(1, pCapMix->nChannels);
-                capRate           = static_cast<double>(pCapMix->nSamplesPerSec);
-                capBytesPerSample = std::max<UINT>(1, pCapMix->wBitsPerSample / 8);
-                capBlockAlign     = pCapMix->nBlockAlign;
-                capIsFloat        = (pCapMix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
-                                    (pCapMix->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
-                                     reinterpret_cast<const WAVEFORMATEXTENSIBLE*>(pCapMix)->SubFormat.Data1 == WAVE_FORMAT_IEEE_FLOAT);
-            }
-        }
-        if (pCapMix) CoTaskMemFree(pCapMix);
-
-        // Tentativa C: Modo Exclusivo 16-bit PCM (caso o driver WDM USB 1.1 como Behringer 2.8.40
-        // recuse o modo compartilhado com 0x8889000F)
-        if (FAILED(hrCapture)) {
-            const DWORD ratesToTry[2] = { static_cast<DWORD>(sampleRate), (sampleRate == 44100.0 ? 48000u : 44100u) };
-            for (int r = 0; r < 2 && FAILED(hrCapture); ++r) {
-                WAVEFORMATEX pcm16 = {};
-                pcm16.wFormatTag      = WAVE_FORMAT_PCM;
-                pcm16.nChannels       = 2;
-                pcm16.nSamplesPerSec  = ratesToTry[r];
-                pcm16.wBitsPerSample  = 16;
-                pcm16.nBlockAlign     = 4;
-                pcm16.nAvgBytesPerSec = ratesToTry[r] * 4;
-                if (pCaptureClient) { pCaptureClient->Release(); pCaptureClient = nullptr; }
-                if (SUCCEEDED(pCaptureDevice->Activate(
-                        __uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pCaptureClient))) && pCaptureClient) {
-                    hrCapture = pCaptureClient->Initialize(AUDCLNT_SHAREMODE_EXCLUSIVE, 0, capDur, capDur, &pcm16, nullptr);
-                    if (SUCCEEDED(hrCapture)) {
-                        capChannels       = 2;
-                        capRate           = static_cast<double>(ratesToTry[r]);
-                        capIsFloat        = false;
-                        capBytesPerSample = 2;
-                        capBlockAlign     = 4;
-                        NanoLog(L"Tentativa C (Exclusivo 16-bit %lu Hz) abriu com sucesso!", ratesToTry[r]);
-                    }
-                }
-            }
-        }
-
-        if (SUCCEEDED(hrCapture) && pCaptureClient &&
-            SUCCEEDED(pCaptureClient->GetService(__uuidof(IAudioCaptureClient), reinterpret_cast<void**>(&pCaptureService))) &&
-            pCaptureService &&
-            SUCCEEDED(pCaptureClient->Start())) {
-            m_captureStreamActive.store(true);
-        } else {
-            if (SUCCEEDED(hrCapture)) hrCapture = E_FAIL;
-            if (pCaptureService) { pCaptureService->Release(); pCaptureService = nullptr; }
-            SetError("nanoAudio: falha ao abrir a entrada (mesa de som).");
-        }
-
-        NanoLog(L"Entrada WASAPI: hr=0x%08lX | canais=%ld | taxa=%.0f Hz | float=%ls | ATIVA=%ls",
-                static_cast<unsigned long>(hrCapture), capChannels, capRate,
-                capIsFloat ? L"sim" : L"nao", m_captureStreamActive.load() ? L"SIM" : L"NAO");
-        if (hrCapture == E_ACCESSDENIED) {
+    CaptureStream cs;
+    cs.rate = sampleRate;
+    bool captureOk = wantInput && pCaptureDevice && OpenCapture(pCaptureDevice, sampleRate, blockFrames, cfg.useExclusiveMode, cfg.bitDepth, cs);
+    if (wantInput) {
+        if (!captureOk) SetError("nanoAudio: falha ao abrir a entrada (mesa de som).");
+        NanoLog(L"Entrada WASAPI: hr=0x%08lX | %ls %ls | canais=%ld | taxa=%.0f Hz | ATIVA=%ls",
+                static_cast<unsigned long>(cs.hr), cs.exclusive ? L"exclusivo" : L"compartilhado", SampleKindName(cs.kind),
+                cs.channels, cs.rate, captureOk ? L"SIM" : L"NAO");
+        if (cs.hr == E_ACCESSDENIED) {
             NanoLog(L"ACESSO NEGADO AO MICROFONE: ative em Configuracoes > Privacidade > Microfone "
                     L"a opcao 'Permitir que aplicativos da area de trabalho acessem o microfone'.");
         }
     }
 
     // ------------------------------------------------------------------------
-    // 3. RING BUFFER FIFO + CONVERSOR DE TAXA (Mesa USB -> blocos do Reaper)
+    // 3. INÍCIO DA SAÍDA E CALIBRAÇÃO
+    //    Toca 400 ms de silêncio medindo quantos frames o dispositivo consome de uma vez
+    //    (a "rajada"): ~48 em HD Audio exclusivo, 480 no mixer do Windows, o dobro em
+    //    drivers USB que puxam dois períodos seguidos. A fila-alvo sai daí, e ainda sobe
+    //    sozinha se chegar a esvaziar.
     // ------------------------------------------------------------------------
-    const size_t fifoCap = std::max<size_t>(static_cast<size_t>(blockFrames) * 16, 16384);
-    std::vector<float> fifo(fifoCap * static_cast<size_t>(numIn), 0.0f);
-    size_t fifoW = 0, fifoR = 0, fifoAvail = 0;
+    const std::wstring renderId  = EndpointId(pRenderDevice);
+    const std::wstring captureId = EndpointId(pCaptureDevice);
+    const long savedBurst  = LoadDeviceTuning(renderId, kTuneBurst, rs.exclusive, sampleRate);
+    const long savedMargin = LoadDeviceTuning(captureId, kTuneMargin, cs.exclusive, sampleRate);
+    long targetFill  = 0;
+    long burstFrames = rs.periodFrames;
+    HANDLE waitHandles[2] = { m_stopEvent, m_renderEvent };
+    uint64_t framesWritten = 0;
 
-    // Pré-carga: 1 bloco + ~12 ms (a mesa entrega pacotes de ~10 ms) para nunca faltar amostra.
-    // Limite: se o FIFO acumular demais (relógios diferentes de entrada e saída), descarta o excesso
-    // para a latência não crescer indefinidamente.
-    const size_t primeFrames = static_cast<size_t>(blockFrames) + static_cast<size_t>(sampleRate * 0.012);
-    const size_t maxFill     = primeFrames + static_cast<size_t>(blockFrames) * 2 + static_cast<size_t>(sampleRate * 0.020);
-    bool primed = false;
-
-    const bool   needResample = std::fabs(capRate - sampleRate) > 0.5;
-    const double rsStep       = capRate / sampleRate; // frames de entrada por frame de saída
-    double       rsPhase      = 0.0;
-    std::vector<float> rsPrev(numIn, 0.0f), rsOut(numIn, 0.0f), curFrame(numIn, 0.0f);
-
-    // Estatísticas para o log de diagnóstico
-    uint64_t statPackets = 0, statSilentPackets = 0, statFrames = 0;
-    uint64_t statUnderruns = 0, statDropped = 0, statBlocks = 0;
-    float    statMaxPeak = 0.0f;
-    bool     loggedFirstSignal = false;
-
-    auto fifoPush = [&](const float* frame) {
-        float* dst = &fifo[fifoW * static_cast<size_t>(numIn)];
-        for (long c = 0; c < numIn; ++c) dst[c] = frame[c];
-        fifoW = (fifoW + 1) % fifoCap;
-        if (fifoAvail < fifoCap) {
-            ++fifoAvail;
-        } else {
-            fifoR = (fifoR + 1) % fifoCap;
-            ++statDropped;
+    auto writeSilence = [&](UINT32 frames) {
+        BYTE* pData = nullptr;
+        if (frames > 0 && SUCCEEDED(rs.service->GetBuffer(frames, &pData))) {
+            rs.service->ReleaseBuffer(frames, AUDCLNT_BUFFERFLAGS_SILENT);
+            framesWritten += frames;
         }
     };
 
-    auto pushCaptured = [&](const float* frame) {
-        if (!needResample) { fifoPush(frame); return; }
-        // Interpolação linear entre o frame anterior e o atual
-        while (rsPhase < 1.0) {
-            const float t = static_cast<float>(rsPhase);
-            for (long c = 0; c < numIn; ++c) rsOut[c] = rsPrev[c] + (frame[c] - rsPrev[c]) * t;
-            fifoPush(rsOut.data());
-            rsPhase += rsStep;
+    if (renderOk) {
+        writeSilence(rs.bufferFrames);
+        const HRESULT hrStart = rs.client->Start();
+        if (FAILED(hrStart)) {
+            renderOk = false;
+            NanoLog(L"Falha ao iniciar a saida (hr=0x%08lX); usando relogio interno.", static_cast<unsigned long>(hrStart));
         }
-        rsPhase -= 1.0;
-        for (long c = 0; c < numIn; ++c) rsPrev[c] = frame[c];
-    };
-
-    auto readSample = [&](const BYTE* base, UINT32 frame, long ch) -> float {
-        const BYTE* p = base + static_cast<size_t>(frame) * capBlockAlign + static_cast<size_t>(ch) * capBytesPerSample;
-        if (capIsFloat) { float v; std::memcpy(&v, p, 4); return v; }
-        switch (capBytesPerSample) {
-            case 2: { int16_t v; std::memcpy(&v, p, 2); return static_cast<float>(v) / 32768.0f; }
-            case 3: {
-                const int32_t v = static_cast<int32_t>((static_cast<uint32_t>(p[0]) << 8) |
-                                                       (static_cast<uint32_t>(p[1]) << 16) |
-                                                       (static_cast<uint32_t>(p[2]) << 24));
-                return static_cast<float>(v >> 8) / 8388608.0f;
+    }
+    if (renderOk) {
+        struct Drop { DWORD ms; long frames; } recent[8] = {};
+        const DWORD windowMs = 6; // consumos quase simultâneos contam como um só
+        long   burst = 0;
+        size_t idx   = 0;
+        const DWORD t0 = timeGetTime();
+        while (timeGetTime() - t0 < 400) {
+            const DWORD w = rs.usesEvent ? WaitForMultipleObjects(2, waitHandles, FALSE, 20) : WaitForSingleObject(m_stopEvent, 1);
+            UINT32 padding = 0;
+            if (w == WAIT_OBJECT_0 || FAILED(rs.client->GetCurrentPadding(&padding))) break;
+            const long drop = static_cast<long>(rs.bufferFrames) - static_cast<long>(padding);
+            if (drop <= 0) continue;
+            writeSilence(static_cast<UINT32>(drop));
+            const DWORD now = timeGetTime();
+            if (now - t0 < 60) continue; // na partida o mixer puxa mais para encher a própria fila
+            recent[idx++ % 8] = { now, drop };
+            long sum = 0;
+            for (const Drop& d : recent) {
+                if (d.frames > 0 && now - d.ms <= windowMs) sum += d.frames;
             }
-            case 4: { int32_t v; std::memcpy(&v, p, 4); return static_cast<float>(v) / 2147483648.0f; }
-            default: return 0.0f;
+            burst = std::max(burst, rs.exclusive ? drop : sum);
         }
+        burst       = std::max(burst, savedBurst);
+        burstFrames = rs.exclusive ? std::max<long>(burst, 1) : std::clamp<long>(burst, rs.periodFrames, rs.periodFrames * 3);
+        targetFill  = rs.exclusive ? burstFrames + blockFrames * 2 + static_cast<long>(sampleRate * 0.002)
+                                   : SharedRenderTarget(blockFrames, burstFrames, rs.periodFrames);
+        targetFill  = std::min<long>(static_cast<long>(rs.bufferFrames), targetFill);
+        NanoLog(L"Saida calibrada: periodo=%ld | rajada=%ld (salva=%ld) | fila-alvo=%ld frames", rs.periodFrames, burstFrames, savedBurst, targetFill);
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. FIFO DE CAPTURA
+    // ------------------------------------------------------------------------
+    const long packetFrames = static_cast<long>(sampleRate * 0.010 + 0.5);
+    CaptureFifo fifo;
+    if (captureOk) {
+        // Só agora: durante a calibração ninguém estaria lendo, e a fila da captura transbordaria
+        cs.hr = cs.client->Start();
+        if (FAILED(cs.hr)) {
+            captureOk = false;
+            SetError("nanoAudio: falha ao iniciar a entrada.");
+            NanoLog(L"Falha ao iniciar a entrada (hr=0x%08lX).", static_cast<unsigned long>(cs.hr));
+        }
+    }
+    if (captureOk) fifo.Configure(numIn, cs.rate, sampleRate, blockFrames, burstFrames, packetFrames, savedMargin);
+
+    std::vector<float>  inMem(static_cast<size_t>(std::max<long>(1, numIn)) * blockFrames, 0.0f);
+    std::vector<float*> inPtr(static_cast<size_t>(std::max<long>(1, numIn)));
+    for (size_t c = 0; c < inPtr.size(); ++c) inPtr[c] = &inMem[c * blockFrames];
+    std::vector<float> curGain(static_cast<size_t>(std::max<long>(1, rs.channels)), 1.0f);
+    for (size_t c = 0; c < curGain.size(); ++c) curGain[c] = volume.Gain(static_cast<long>(c));
+    const float gainCoef = static_cast<float>(1.0 - std::exp(-blockFrames / (sampleRate * 0.010)));
+
+    LARGE_INTEGER qpcFreq, qpcStart;
+    QueryPerformanceFrequency(&qpcFreq);
+    QueryPerformanceCounter(&qpcStart);
+    auto qpcSeconds = [&]() {
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        return static_cast<double>(q.QuadPart) / static_cast<double>(qpcFreq.QuadPart);
+    };
+
+    // Latência REAL, pelos relógios do WASAPI: quando foi captada a próxima amostra a entregar à
+    // DAW e quando vai tocar a próxima a ser gravada. A soma é o que a DAW usa para alinhar gravações.
+    // No modo exclusivo a posição informada por alguns drivers não é confiável (na Realtek começa com
+    // ~100 ms de erro): ali vale a fila, mais o passo em trânsito no hardware e a latência declarada.
+    IAudioClock*   renderClock     = nullptr;
+    UINT64         renderClockFreq = 0;
+    REFERENCE_TIME hwLatency       = 0;
+    if (renderOk && rs.exclusive) rs.client->GetStreamLatency(&hwLatency);
+    if (renderOk && !rs.exclusive && (FAILED(rs.client->GetService(__uuidof(IAudioClock), reinterpret_cast<void**>(&renderClock))) ||
+                     FAILED(renderClock->GetFrequency(&renderClockFreq)) || renderClockFreq == 0)) {
+        SafeRelease(renderClock);
+    }
+    double newestCapture = 0.0;   // instante (s) da amostra mais nova no FIFO
+    double avgIn = 0.0, avgOut = 0.0;
+    long   latSamples  = 0;
+    double nextMeasure = qpcSeconds() + 1.5; // espera o FIFO assentar
+
+    auto measureLatency = [&]() {
+        const double now = qpcSeconds();
+        if (now < nextMeasure || !renderOk) return;
+        nextMeasure = now + 0.05;
+        double out = -1.0;
+        if (rs.exclusive) {
+            UINT32 padding = 0;
+            if (FAILED(rs.client->GetCurrentPadding(&padding))) return;
+            out = static_cast<double>(padding) + burstFrames + static_cast<double>(hwLatency) * sampleRate / 1e7;
+        } else {
+            UINT64 pos = 0, posQpc = 0;
+            if (!renderClock || FAILED(renderClock->GetPosition(&pos, &posQpc)) || posQpc == 0) return;
+            const double played = static_cast<double>(pos) * sampleRate / static_cast<double>(renderClockFreq);
+            out = (static_cast<double>(posQpc) / 1e7 - now) * sampleRate + (static_cast<double>(framesWritten) - played);
+        }
+        double in = 0.0;
+        if (captureOk) {
+            if (newestCapture <= 0.0 || !fifo.Running()) return;
+            in = (now - newestCapture + static_cast<double>(fifo.PendingFrames()) / cs.rate) * sampleRate;
+        }
+        // Descarta leituras sem sentido (drivers com carimbo de tempo ruim)
+        if (out < 0.0 || out > sampleRate * 0.5 || in < 0.0 || in > sampleRate * 0.5) return;
+        ++latSamples;
+        const double k = 1.0 / static_cast<double>(std::min<long>(latSamples, 40));
+        avgIn  += (in - avgIn) * k;
+        avgOut += (out - avgOut) * k;
+        if (latSamples >= 20) {
+            m_outputLatencyFrames = static_cast<long>(avgOut + 0.5);
+            if (captureOk) m_inputLatencyFrames = static_cast<long>(avgIn + 0.5);
+        }
+    };
+
+    // Estatísticas para o log de diagnóstico (gravado só no stop)
+    uint64_t statPackets = 0, statSilentPackets = 0, statFrames = 0, statGaps = 0, statBlocks = 0, statOutUnderruns = 0;
+    float    statMaxPeak = 0.0f;
+
+    uint64_t clockFrames = 0;       // relógio interno (só sem dispositivo de saída)
+    bool     deviceLost  = false;
+
+    auto onDeviceLost = [&](const wchar_t* which, HRESULT h) {
+        NanoLog(L"Dispositivo de %ls perdido (hr=0x%08lX).", which, static_cast<unsigned long>(h));
+        deviceLost = true;
+    };
+
+    auto onCaptureLost = [&](HRESULT h) {
+        captureOk = false; // a entrada vira silêncio; o áudio da saída continua
+        std::fill(inMem.begin(), inMem.end(), 0.0f);
+        onDeviceLost(L"entrada", h);
+    };
+
+    // Alguns drivers (ex.: Realtek/Intel SST) às vezes entram, no modo exclusivo, em um estado em que
+    // devolvem o buffer inteiro com dados velhos. Reiniciar a entrada resolve; se insistir, ela passa
+    // para o modo compartilhado (a saída continua exclusiva).
+    int    captureRestarts = 0;
+    double lastDrain       = 0.0;
+    auto recoverExclusiveCapture = [&]() {
+        ++captureRestarts;
+        NanoLog(L"Entrada exclusiva devolveu dados repetidos; %ls.", captureRestarts <= 3 ? L"reiniciando" : L"passando para o modo compartilhado");
+        cs.client->Stop();
+        HRESULT h = cs.client->Reset();
+        if (captureRestarts <= 3) {
+            if (SUCCEEDED(h)) h = cs.client->Start();
+        } else {
+            cs.Close();
+            h = OpenCapture(pCaptureDevice, sampleRate, blockFrames, false, cfg.bitDepth, cs) ? cs.client->Start() : E_FAIL;
+            if (SUCCEEDED(h)) fifo.Configure(numIn, cs.rate, sampleRate, blockFrames, burstFrames, packetFrames, savedMargin);
+        }
+        lastDrain = 0.0;
+        if (FAILED(h)) onCaptureLost(h);
     };
 
     // Lê TODOS os pacotes disponíveis da mesa e coloca no FIFO
     auto drainCapture = [&]() {
-        if (!pCaptureService) return;
-        UINT32 pkt = 0;
-        float  peak = 0.0f;
-        bool   gotData = false;
-        while (SUCCEEDED(pCaptureService->GetNextPacketSize(&pkt)) && pkt > 0) {
-            BYTE*  pCap  = nullptr;
+        const double drainStart = qpcSeconds();
+        const double sinceLast  = drainStart - lastDrain;
+        lastDrain = drainStart;
+        while (captureOk) {
+            BYTE*  data  = nullptr;
             UINT32 n     = 0;
             DWORD  flags = 0;
-            if (FAILED(pCaptureService->GetBuffer(&pCap, &n, &flags, nullptr, nullptr))) break;
+            UINT64 qpcPos = 0;
+            HRESULT h = S_OK;
+            if (!cs.exclusive) { // GetNextPacketSize só vale para o modo compartilhado
+                h = cs.service->GetNextPacketSize(&n);
+                if (SUCCEEDED(h) && n == 0) return;
+            }
+            if (SUCCEEDED(h)) h = cs.service->GetBuffer(&data, &n, &flags, nullptr, &qpcPos);
+            if (h == AUDCLNT_S_BUFFER_EMPTY) return;
+            if (FAILED(h)) { onCaptureLost(h); return; }
+            if (n == 0) { cs.service->ReleaseBuffer(0); return; }
 
-            const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !pCap;
+            // Buffer inteiro cheio sem que o driver tenha demorado a ler: dados repetidos
+            if (cs.exclusive && n >= cs.bufferFrames && sinceLast < 0.5 * cs.bufferFrames / cs.rate) {
+                cs.service->ReleaseBuffer(n);
+                recoverExclusiveCapture();
+                return;
+            }
+
+            const bool silent = (flags & AUDCLNT_BUFFERFLAGS_SILENT) != 0 || !data;
             ++statPackets;
-            if (silent) ++statSilentPackets;
             statFrames += n;
+            if (silent) ++statSilentPackets;
+            if ((flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) && statPackets > 1) ++statGaps;
+            if (qpcPos != 0 && !(flags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)) {
+                // Uma amostra não pode ter sido captada depois de recebida (há drivers que carimbam a entrega)
+                newestCapture = std::min(static_cast<double>(qpcPos) / 1e7 + static_cast<double>(n) / cs.rate, qpcSeconds());
+            }
 
-            for (UINT32 f = 0; f < n; ++f) {
+            for (UINT32 done = 0; done < n;) {
+                const size_t chunk = std::min<size_t>(n - done, fifo.MaxWrite());
+                fifo.PrepareWrite(chunk);
                 for (long c = 0; c < numIn; ++c) {
+                    float* dst = fifo.WritePtr(c);
                     if (silent) {
-                        curFrame[c] = 0.0f;
-                    } else {
-                        // Mesa mono -> duplica o canal 1; mesa estéreo -> In1=L, In2=R
-                        const long srcCh = std::min<long>(c, capChannels - 1);
-                        const float s = readSample(pCap, f, srcCh);
-                        curFrame[c] = s;
-                        peak = std::max(peak, std::fabs(s));
+                        std::memset(dst, 0, chunk * sizeof(float));
+                        continue;
                     }
+                    // Mesa mono -> duplica o canal 1; mesa estéreo -> In1=L, In2=R
+                    const size_t srcCh = static_cast<size_t>(std::min<long>(c, cs.channels - 1));
+                    const BYTE*  src   = data + static_cast<size_t>(done) * cs.blockAlign + srcCh * (cs.blockAlign / cs.channels);
+                    statMaxPeak = std::max(statMaxPeak, LoadChannel(src, cs.blockAlign, cs.kind, dst, chunk));
                 }
-                pushCaptured(curFrame.data());
+                fifo.CommitWrite(chunk);
+                done += static_cast<UINT32>(chunk);
             }
-            pCaptureService->ReleaseBuffer(n);
-            gotData = true;
-        }
-        if (gotData) {
-            m_inputPeakMeter.store(peak, std::memory_order_relaxed);
-            statMaxPeak = std::max(statMaxPeak, peak);
-            if (!loggedFirstSignal && peak > 0.0005f) {
-                loggedFirstSignal = true;
-                NanoLog(L"Primeiro sinal real recebido da entrada (pico=%.4f).", peak);
-            }
+            cs.service->ReleaseBuffer(n);
         }
     };
 
-    // Processa UM bloco ASIO: entrada -> bufferSwitch do Reaper -> saída
+    const DWORD blockMs = std::max<DWORD>(1, static_cast<DWORD>((1000.0 * blockFrames) / sampleRate));
+    int outputReadyMisses = 0;
+
+    // Processa UM bloco ASIO: entrada -> bufferSwitch da DAW -> saída
     auto processBlock = [&](long dbIdx) {
-        if (!primed && fifoAvail >= primeFrames) primed = true;
-        if (primed && fifoAvail < static_cast<size_t>(blockFrames)) {
-            primed = false;
-            ++statUnderruns;
-        }
-        if (primed && fifoAvail > maxFill) {
-            const size_t drop = fifoAvail - primeFrames;
-            fifoR = (fifoR + drop) % fifoCap;
-            fifoAvail -= drop;
-            statDropped += drop;
-        }
-
-        for (long f = 0; f < blockFrames; ++f) {
-            const float* fr = primed ? &fifo[fifoR * static_cast<size_t>(numIn)] : nullptr;
-            for (size_t chIdx = 0; chIdx < m_activeChannels.size(); ++chIdx) {
-                const ASIOBufferInfo& bi = m_activeChannels[chIdx];
-                if (bi.isInput) {
-                    float* dst = static_cast<float*>(bi.buffers[dbIdx]);
-                    const long hwCh = std::clamp<long>(bi.channelNum, 0, numIn - 1);
-                    dst[f] = fr ? fr[hwCh] : 0.0f;
-                }
-            }
-            if (primed) {
-                fifoR = (fifoR + 1) % fifoCap;
-                --fifoAvail;
+        if (captureOk && fifo.Starving()) {
+            // Pacote de entrada levemente atrasado: espera um pouco, gastando no máximo metade do que
+            // já está na fila de saída, em vez de entregar silêncio à DAW.
+            UINT32 queued = 0;
+            if (!renderOk || FAILED(rs.client->GetCurrentPadding(&queued))) queued = 0;
+            const double deadline = qpcSeconds() + std::min(0.004, static_cast<double>(queued) * 0.5 / sampleRate);
+            while (captureOk && fifo.Starving() && qpcSeconds() < deadline) {
+                if (WaitForSingleObject(m_stopEvent, 1) == WAIT_OBJECT_0) break;
+                drainCapture();
             }
         }
+        if (captureOk) fifo.ReadBlock(inPtr.data());
+        for (const ASIOBufferInfo& bi : m_activeChannels) {
+            if (bi.isInput) std::memcpy(bi.buffers[dbIdx], inPtr[bi.channelNum], static_cast<size_t>(blockFrames) * sizeof(float));
+        }
 
-        LARGE_INTEGER qpc, freq;
-        QueryPerformanceCounter(&qpc);
-        QueryPerformanceFrequency(&freq);
-        const uint64_t nowNs = static_cast<uint64_t>((static_cast<double>(qpc.QuadPart) * 1e9) / freq.QuadPart);
+        // O ASIO define systemTime na mesma base do timeGetTime() (usada pelas DAWs para o MIDI)
+        const uint64_t nowNs = static_cast<uint64_t>(timeGetTime()) * 1000000ULL;
         m_systemTimeNs.store(nowNs, std::memory_order_relaxed);
+        ResetEvent(m_outputReadyEvent);
 
-        if (m_callbacks.bufferSwitchTimeInfo) {
+        if (m_hostUsesTimeInfo) {
             ASIOTime timeParams = {};
             const uint64_t pos = m_samplePosition.load(std::memory_order_relaxed);
             timeParams.timeInfo.speed             = 1.0;
@@ -951,26 +1435,36 @@ DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
             timeParams.timeInfo.systemTime.lo     = static_cast<unsigned long>(nowNs & 0xFFFFFFFFULL);
             timeParams.timeInfo.flags             = kSystemTimeValid | kSamplePositionValid | kSampleRateValid;
             m_callbacks.bufferSwitchTimeInfo(&timeParams, dbIdx, ASIOTrue);
-        } else if (m_callbacks.bufferSwitch) {
+        } else {
             m_callbacks.bufferSwitch(dbIdx, ASIOTrue);
+        }
+
+        // Host que processa em outra thread: espera o outputReady() antes de ler a saída
+        if (m_hostUsesOutputReady.load(std::memory_order_relaxed)) {
+            if (WaitForSingleObject(m_outputReadyEvent, blockMs * 2) == WAIT_OBJECT_0) {
+                outputReadyMisses = 0;
+            } else if (++outputReadyMisses >= 4) {
+                m_hostUsesOutputReady.store(false, std::memory_order_relaxed);
+                outputReadyMisses = 0;
+            }
         }
 
         if (renderOk) {
             BYTE* pData = nullptr;
-            const UINT32 framesToWrite = static_cast<UINT32>(blockFrames);
-            if (SUCCEEDED(pRenderService->GetBuffer(framesToWrite, &pData)) && pData) {
-                float* dst = reinterpret_cast<float*>(pData);
-                std::memset(dst, 0, static_cast<size_t>(framesToWrite) * renderChannels * sizeof(float));
-                for (size_t chIdx = 0; chIdx < m_activeChannels.size(); ++chIdx) {
-                    const ASIOBufferInfo& bi = m_activeChannels[chIdx];
-                    if (!bi.isInput && bi.channelNum >= 0 && bi.channelNum < renderChannels) {
-                        const float* src = static_cast<const float*>(bi.buffers[dbIdx]);
-                        for (UINT32 f = 0; f < framesToWrite; ++f) {
-                            dst[static_cast<size_t>(f) * renderChannels + bi.channelNum] = src[f];
-                        }
-                    }
+            if (SUCCEEDED(rs.service->GetBuffer(static_cast<UINT32>(blockFrames), &pData)) && pData) {
+                std::memset(pData, 0, static_cast<size_t>(blockFrames) * rs.blockAlign);
+                const size_t bytesPerSample = static_cast<size_t>(rs.blockAlign / rs.channels);
+                for (const ASIOBufferInfo& bi : m_activeChannels) {
+                    if (bi.isInput || bi.channelNum >= rs.channels) continue;
+                    const float g0 = curGain[bi.channelNum];
+                    const float gt = volume.Gain(bi.channelNum);
+                    const float g1 = (std::fabs(gt - g0) < gt * 1e-4f) ? gt : g0 + (gt - g0) * gainCoef;
+                    StoreChannel(pData + bytesPerSample * bi.channelNum, rs.blockAlign, rs.kind,
+                                 static_cast<const float*>(bi.buffers[dbIdx]), static_cast<size_t>(blockFrames), g0, g1);
+                    curGain[bi.channelNum] = g1;
                 }
-                pRenderService->ReleaseBuffer(framesToWrite, 0);
+                rs.service->ReleaseBuffer(static_cast<UINT32>(blockFrames), 0);
+                framesWritten += static_cast<uint64_t>(blockFrames);
             }
         }
 
@@ -979,55 +1473,48 @@ DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
     };
 
     // ------------------------------------------------------------------------
-    // 4. LOOP PRINCIPAL
-    //    CORREÇÃO: processa QUANTOS blocos couberem a cada despertar. Antes era
-    //    apenas 1 bloco por evento do WASAPI (~10 ms), o que fazia o Reaper receber
-    //    menos amostras do que a mesa enviava (áudio picotado / entrada "sumindo").
-    //    Se a saída não abrir, o driver usa um relógio interno e a ENTRADA continua
-    //    chegando ao Reaper normalmente.
+    // 5. LOOP PRINCIPAL
+    //    Processa QUANTOS blocos couberem a cada despertar. Se a saída não abrir (ou
+    //    for desconectada), um relógio interno mantém a DAW viva e a ENTRADA chegando.
     // ------------------------------------------------------------------------
-    if (renderOk) {
-        BYTE* pData = nullptr;
-        if (SUCCEEDED(pRenderService->GetBuffer(renderBufferSize, &pData))) {
-            pRenderService->ReleaseBuffer(renderBufferSize, AUDCLNT_BUFFERFLAGS_SILENT);
-        }
-        if (FAILED(pRenderClient->Start())) {
-            renderOk = false;
-            NanoLog(L"Falha ao iniciar a saida; usando relogio interno.");
-        }
-    }
-
-    LARGE_INTEGER qpcFreq, qpcStart;
-    QueryPerformanceFrequency(&qpcFreq);
-    QueryPerformanceCounter(&qpcStart);
-    uint64_t clockFrames = 0;
-    long     dbIdx       = 0;
-    bool     deviceLost  = false;
-    const DWORD blockMs  = std::max<DWORD>(1, static_cast<DWORD>((1000.0 * blockFrames) / sampleRate));
-    HANDLE waitHandles[2] = { m_stopEvent, m_renderEvent };
+    long dbIdx          = 0;
+    bool resetRequested = false;
 
     while (m_running.load(std::memory_order_relaxed)) {
-        DWORD waitResult;
-        if (renderOk && renderUsesEvent) {
-            waitResult = WaitForMultipleObjects(2, waitHandles, FALSE, blockMs * 2 + 10);
-        } else {
-            waitResult = WaitForSingleObject(m_stopEvent, 1);
-        }
+        const DWORD waitResult = (renderOk && rs.usesEvent)
+            ? WaitForMultipleObjects(2, waitHandles, FALSE, blockMs * 2 + 10)
+            : WaitForSingleObject(m_stopEvent, 1);
         if (waitResult == WAIT_OBJECT_0) break; // stop()
 
         drainCapture();
 
-        for (int guard = 0; guard < 64 && m_running.load(std::memory_order_relaxed); ++guard) {
+        bool firstPass = true;
+        for (int guard = 0; guard < 256 && m_running.load(std::memory_order_relaxed); ++guard) {
             if (renderOk) {
                 UINT32 padding = 0;
-                const HRESULT hp = pRenderClient->GetCurrentPadding(&padding);
+                const HRESULT hp = rs.client->GetCurrentPadding(&padding);
                 if (FAILED(hp)) {
-                    deviceLost = true;
-                    NanoLog(L"Dispositivo de saida perdido (hr=0x%08lX).", static_cast<unsigned long>(hp));
+                    renderOk    = false;
+                    clockFrames = 0;
+                    QueryPerformanceCounter(&qpcStart);
+                    onDeviceLost(L"saida", hp);
                     break;
                 }
-                const UINT32 freeFrames = (renderBufferSize > padding) ? (renderBufferSize - padding) : 0;
-                if (freeFrames < static_cast<UINT32>(blockFrames)) break;
+                if (firstPass && padding == 0 && statBlocks > 0) {
+                    // A fila esvaziou (estalo): passa a manter mais áudio adiantado. O acréscimo entra
+                    // como silêncio; produzido pela DAW, ele consumiria a folga do FIFO de entrada.
+                    ++statOutUnderruns;
+                    const long wanted = rs.exclusive ? targetFill + std::max<long>(blockFrames, rs.periodFrames / 2)
+                                                     : std::max(targetFill + std::max<long>(blockFrames, rs.periodFrames / 2),
+                                                                SharedRenderTarget(blockFrames, rs.periodFrames * 2, rs.periodFrames));
+                    const long grown  = std::min<long>(static_cast<long>(rs.bufferFrames), wanted);
+                    writeSilence(static_cast<UINT32>(std::max<long>(0, grown - targetFill)));
+                    targetFill = grown;
+                    padding    = 0;
+                    rs.client->GetCurrentPadding(&padding);
+                }
+                firstPass = false;
+                if (static_cast<long>(padding) + blockFrames > targetFill) break;
             } else {
                 LARGE_INTEGER now;
                 QueryPerformanceCounter(&now);
@@ -1037,40 +1524,60 @@ DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
                     clockFrames = static_cast<uint64_t>(elapsed) - static_cast<uint64_t>(blockFrames);
                 }
                 if (static_cast<double>(clockFrames + blockFrames) > elapsed) break;
+                clockFrames += static_cast<uint64_t>(blockFrames);
             }
 
+            measureLatency();
             processBlock(dbIdx);
             dbIdx ^= 1;
-            clockFrames += static_cast<uint64_t>(blockFrames);
             drainCapture();
         }
-        if (deviceLost) {
-            SetError("nanoAudio: dispositivo de saida desconectado.");
-            break;
+
+        // Mesa desconectada ou formato alterado no Windows: pede à DAW para reabrir o driver
+        if (deviceLost && !resetRequested) {
+            resetRequested = true;
+            SetError("nanoAudio: dispositivo de audio desconectado.");
+            RequestHostReset();
         }
     }
 
-    if (renderOk) pRenderClient->Stop();
+    if (rs.client) rs.client->Stop();
+    if (cs.client) cs.client->Stop();
+    volume.Stop();
 
-    NanoLog(L"==== stop(): blocos=%llu | pacotes entrada=%llu (silenciosos=%llu) | frames entrada=%llu | "
-            L"pico max=%.4f | faltas=%llu | descartados=%llu",
+    if (latSamples >= 20) {
+        const LatencyEstimate e = EstimateLatency(blockFrames, sampleRate, rs.exclusive);
+        SaveDeviceTuning(renderId, kTuneOutExtra, rs.exclusive, avgOut - e.outputFrames, sampleRate);
+        if (captureOk) SaveDeviceTuning(captureId, kTuneInExtra, rs.exclusive, avgIn - e.inputFrames, sampleRate);
+    }
+    if (statOutUnderruns > 0 && renderOk) {
+        const long slack = rs.exclusive ? blockFrames * 2 + static_cast<long>(sampleRate * 0.002)
+                                        : SharedRenderTarget(blockFrames, 0, rs.periodFrames);
+        SaveDeviceTuning(renderId, kTuneBurst, rs.exclusive, targetFill - slack, sampleRate);
+    }
+    if (fifo.Underruns() > 0 && captureOk) {
+        SaveDeviceTuning(captureId, kTuneMargin, cs.exclusive, fifo.MarginFrames(), sampleRate);
+    }
+    SafeRelease(renderClock);
+    NanoLog(L"==== stop(): blocos=%llu | pacotes entrada=%llu (silenciosos=%llu, descontinuidades=%llu) | frames entrada=%llu | "
+            L"pico max=%.4f | faltas=%llu | descartados=%llu | margem=%ld | reinicios=%d | esvaziamentos da saida=%llu | fila=%ld | "
+            L"latencia medida: entrada=%.0f saida=%.0f frames (%.1f ms ida e volta)",
             static_cast<unsigned long long>(statBlocks), static_cast<unsigned long long>(statPackets),
-            static_cast<unsigned long long>(statSilentPackets), static_cast<unsigned long long>(statFrames),
-            statMaxPeak, static_cast<unsigned long long>(statUnderruns), static_cast<unsigned long long>(statDropped));
-    if (m_captureStreamActive.load() && statPackets > 0 && statMaxPeak < 0.0005f) {
+            static_cast<unsigned long long>(statSilentPackets), static_cast<unsigned long long>(statGaps),
+            static_cast<unsigned long long>(statFrames), statMaxPeak,
+            static_cast<unsigned long long>(fifo.Underruns()), static_cast<unsigned long long>(fifo.SkippedFrames()),
+            captureOk ? fifo.MarginFrames() : 0L, captureRestarts, static_cast<unsigned long long>(statOutUnderruns), targetFill,
+            avgIn, avgOut, (avgIn + avgOut) * 1000.0 / sampleRate);
+    if (statPackets > 200 && statMaxPeak < 0.0005f) {
         NanoLog(L"AVISO: a entrada abriu mas so chegou SILENCIO. Verifique: privacidade do microfone do Windows, "
-                L"nivel/mudo do 'Microfone (USB Audio CODEC)' em Som > Gravacao, e o fader MAIN da mesa.");
+                L"nivel/mudo do dispositivo de entrada em Som > Gravacao, e o fader MAIN da mesa.");
     }
 
-    m_captureStreamActive.store(false);
-    if (pCaptureClient)  pCaptureClient->Stop();
-    if (pCaptureService) pCaptureService->Release();
-    if (pCaptureClient)  pCaptureClient->Release();
-    if (pRenderService)  pRenderService->Release();
-    if (pRenderClient)   pRenderClient->Release();
-    if (pCaptureDevice)  pCaptureDevice->Release();
-    if (pRenderDevice)   pRenderDevice->Release();
-    if (pEnum)           pEnum->Release();
+    cs.Close();
+    rs.Close();
+    SafeRelease(pCaptureDevice);
+    SafeRelease(pRenderDevice);
+    SafeRelease(pEnum);
 
     if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
     timeEndPeriod(1);
@@ -1083,30 +1590,31 @@ DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
 // ============================================================================
 
 void UniversalWasapiAsioDriver::ApplyNewConfigFromGui(const DriverUserConfig& newCfg) {
-    m_config = newCfg;
-    SaveUserConfig(m_config);
+    const bool rateChanged   = newCfg.preferredSampleRate != m_config.preferredSampleRate;
+    const bool deviceChanged = std::wcscmp(newCfg.outputDeviceId, m_config.outputDeviceId) != 0 ||
+                               std::wcscmp(newCfg.inputDeviceId, m_config.inputDeviceId) != 0;
+    m_config = newCfg; // o painel já gravou no Registro
     ProbeHardwareCapabilities();
-    if (m_callbacks.asioMessage) {
-        m_callbacks.asioMessage(kAsioResetRequest, 0, nullptr, nullptr);
-    }
+
+    // Só troca a taxa se o usuário mexeu nela (a DAW pode ter definido outra via setSampleRate)
+    const double wantedRate = (newCfg.preferredSampleRate > 0) ? static_cast<double>(newCfg.preferredSampleRate) : m_nativeMixRate;
+    if (rateChanged || (deviceChanged && newCfg.preferredSampleRate == 0)) m_sampleRate = wantedRate;
+
+    UpdateLatencyEstimate(m_buffersCreated ? m_activeBufferFrames
+                                           : (m_config.customBufferFrames > 0 ? m_config.customBufferFrames : kPreferredBufferFrames));
+    if (m_callbacks.asioMessage) m_callbacks.asioMessage(kAsioResetRequest, 0, nullptr, nullptr);
 }
 
 void UniversalWasapiAsioDriver::ShowNativeControlPanelDialog() {
+    // A janela dona precisa ser deste processo: ela é desabilitada enquanto o painel está aberto
     HWND hParent = (m_sysHandle && IsWindow(m_sysHandle)) ? m_sysHandle : GetForegroundWindow();
-    if (hParent && !IsWindow(hParent)) hParent = nullptr;
+    if (hParent) hParent = GetAncestor(hParent, GA_ROOT);
+    DWORD pid = 0;
+    if (hParent) GetWindowThreadProcessId(hParent, &pid);
+    if (pid != GetCurrentProcessId()) hParent = nullptr;
 
     DriverUserConfig cfgCopy = m_config;
-    bool applied = ShowControlPanelWindow(
-        hParent,
-        &cfgCopy,
-        true, // inDawMode
-        m_nativeMixRate > 0 ? m_nativeMixRate : 48000.0,
-        m_hwMinBufferFrames,
-        m_hwPreferredBufferFrames,
-        m_hwMaxBufferFrames
-    );
-
-    if (applied) {
+    if (ShowControlPanelWindow(hParent, &cfgCopy, true /* inDawMode */, kPreferredBufferFrames)) {
         ApplyNewConfigFromGui(cfgCopy);
     }
 }

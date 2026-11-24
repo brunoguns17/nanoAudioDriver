@@ -17,6 +17,8 @@
 
 #include <windows.h>
 #include <mmdeviceapi.h>
+#include <algorithm>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -29,9 +31,10 @@ struct DriverUserConfig {
     wchar_t inputDeviceId[256]    = {};  // ID do endpoint WASAPI de entrada
     wchar_t inputDeviceName[128]  = {};  // Nome amigável de entrada
     bool    useExclusiveMode      = false; // false = Shared (multi-app), true = Exclusive
+    bool    ignoreWindowsVolume   = true;  // compensa o volume (por software) do Windows no modo compartilhado
     bool    enableInputCapture    = true;  // true = Full Duplex (Entrada + Saída)
     long    customBufferFrames    = 0;     // 0 = Automático, ou 64, 128, 256, 512, 1024, 2048
-    long    preferredSampleRate   = 48000; // 44100, 48000, 88200, 96000, 192000
+    long    preferredSampleRate   = 0;     // 0 = Automático (taxa do Windows), ou 44100, 48000, 88200, 96000, 192000
     long    bitDepth              = 32;    // 16, 24, 32 (Float)
     long    numChannelsOut        = 2;     // 2 (Estéreo), 4, 6, 8
     long    numChannelsIn         = 2;     // 1 (Mono), 2 (Estéreo)
@@ -41,6 +44,27 @@ struct AudioDeviceEntry {
     std::wstring id;
     std::wstring name;
 };
+
+// Fila de saída mantida no modo compartilhado: o que o Windows consome de uma vez (a rajada: um
+// período ou mais, conforme o dispositivo) mais a folga para a DAW calcular os próximos blocos.
+inline long SharedRenderTarget(long blockFrames, long burstFrames, long periodFrames) {
+    return burstFrames + std::max(blockFrames * 2, periodFrames / 2);
+}
+
+struct LatencyEstimate {
+    long inputFrames  = 0;
+    long outputFrames = 0;
+};
+
+// Latência prevista com o período padrão de 10 ms do Windows. Com o áudio rodando o driver mede
+// a latência real e passa a reportá-la à DAW.
+inline LatencyEstimate EstimateLatency(long blockFrames, double sampleRate, bool exclusive) {
+    const long period = static_cast<long>(sampleRate * 0.010 + 0.5);
+    LatencyEstimate e;
+    e.inputFrames  = period + static_cast<long>(sampleRate * 0.004 + 0.5);
+    e.outputFrames = exclusive ? blockFrames * 2 + period : SharedRenderTarget(blockFrames, period, period) + period;
+    return e;
+}
 
 // Funções utilitárias
 std::vector<AudioDeviceEntry> EnumerateAudioDevices(EDataFlow flow);
@@ -53,9 +77,5 @@ bool ShowControlPanelWindow(
     HWND hWndParent,
     DriverUserConfig* inOutConfig,
     bool inDawMode,
-    double nativeMixRate = 48000.0,
-    long hwMinFrames = 64,
-    long hwDefFrames = 256,
-    long hwMaxFrames = 2048
+    long autoBufferFrames = 256
 );
-

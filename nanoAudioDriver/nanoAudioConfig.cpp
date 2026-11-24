@@ -6,7 +6,9 @@
 
 #include "nanoAudioConfig.h"
 #include "nanoAudioVersion.h"
+#include "nanoAudioVolume.h"
 #include "nanoAudioUpdateState.h"
+#include <audioclient.h>
 #include <commctrl.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstdio>
@@ -58,8 +60,14 @@ enum ControlIDs {
     IDC_BTN_DEFAULTS,
 
     IDC_LBL_QUICK,
-    IDC_BTN_UPDATES
+    IDC_BTN_UPDATES,
+
+    IDC_CHK_IGNORE_VOL,
+    IDC_STATUS_VOLUME,
+    IDC_LBL_MODE_HINT
 };
+
+static const UINT_PTR kVolumeTimerId = 1;
 
 // ============================================================================
 // ENUMERAÇÃO DE DISPOSITIVOS DE ÁUDIO WASAPI
@@ -90,7 +98,7 @@ std::vector<AudioDeviceEntry> EnumerateAudioDevices(EDataFlow flow) {
                 if (SUCCEEDED(pDev->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
                     PROPVARIANT varName;
                     PropVariantInit(&varName);
-                    if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.pwszVal) {
+                    if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.vt == VT_LPWSTR && varName.pwszVal) {
                         name = varName.pwszVal;
                     }
                     PropVariantClear(&varName);
@@ -110,6 +118,36 @@ std::vector<AudioDeviceEntry> EnumerateAudioDevices(EDataFlow flow) {
     return devices;
 }
 
+// Volume do Windows e taxa do mixer do dispositivo de saída ("" = padrão do Windows)
+struct OutputDeviceInfo {
+    nanoAudioVolume::EndpointVolume volume;
+    long                            mixRate = 0;
+};
+
+static OutputDeviceInfo QueryOutputDevice(const std::wstring& id, bool withMixRate) {
+    OutputDeviceInfo info;
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum))) || !pEnum) return info;
+    IMMDevice* pDev = nullptr;
+    const HRESULT hr = id.empty() ? pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDev) : pEnum->GetDevice(id.c_str(), &pDev);
+    if (SUCCEEDED(hr) && pDev) {
+        info.volume = nanoAudioVolume::Query(pDev);
+        IAudioClient* pClient = nullptr;
+        if (withMixRate && SUCCEEDED(pDev->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, reinterpret_cast<void**>(&pClient))) && pClient) {
+            WAVEFORMATEX* mix = nullptr;
+            if (SUCCEEDED(pClient->GetMixFormat(&mix)) && mix) {
+                info.mixRate = static_cast<long>(mix->nSamplesPerSec);
+                CoTaskMemFree(mix);
+            }
+            pClient->Release();
+        }
+        pDev->Release();
+    }
+    pEnum->Release();
+    return info;
+}
+
 // ============================================================================
 // PERSISTÊNCIA NO REGISTRO DO WINDOWS (HKCU)
 // ============================================================================
@@ -126,6 +164,10 @@ DriverUserConfig LoadUserConfig() {
             cfg.useExclusiveMode = (val != 0);
 
         sz = sizeof(DWORD);
+        if (RegQueryValueExW(hKey, L"IgnoreWindowsVolume", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS)
+            cfg.ignoreWindowsVolume = (val != 0);
+
+        sz = sizeof(DWORD);
         if (RegQueryValueExW(hKey, L"EnableInput", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS)
             cfg.enableInputCapture = (val != 0);
 
@@ -134,8 +176,8 @@ DriverUserConfig LoadUserConfig() {
             cfg.customBufferFrames = static_cast<long>(val);
 
         sz = sizeof(DWORD);
-        if (RegQueryValueExW(hKey, L"SampleRate", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS && val > 0)
-            cfg.preferredSampleRate = static_cast<long>(val);
+        if (RegQueryValueExW(hKey, L"SampleRate", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS)
+            cfg.preferredSampleRate = static_cast<long>(val); // 0 = automático
 
         sz = sizeof(DWORD);
         if (RegQueryValueExW(hKey, L"BitDepth", nullptr, nullptr, reinterpret_cast<LPBYTE>(&val), &sz) == ERROR_SUCCESS && val > 0)
@@ -169,6 +211,15 @@ DriverUserConfig LoadUserConfig() {
 
         RegCloseKey(hKey);
     }
+
+    // O Registro não garante o terminador das strings nem valores dentro da faixa
+    cfg.outputDeviceId[255] = cfg.outputDeviceName[127] = L'\0';
+    cfg.inputDeviceId[255]  = cfg.inputDeviceName[127]  = L'\0';
+    if (cfg.preferredSampleRate != 0 && (cfg.preferredSampleRate < 44100 || cfg.preferredSampleRate > 192000)) cfg.preferredSampleRate = 0;
+    if (cfg.customBufferFrames != 0 && (cfg.customBufferFrames < 32 || cfg.customBufferFrames > 2048)) cfg.customBufferFrames = 0;
+    if (cfg.bitDepth != 16 && cfg.bitDepth != 24) cfg.bitDepth = 32;
+    if (cfg.numChannelsOut < 1 || cfg.numChannelsOut > 64) cfg.numChannelsOut = 2;
+    if (cfg.numChannelsIn < 1 || cfg.numChannelsIn > 64) cfg.numChannelsIn = 2;
     return cfg;
 }
 
@@ -176,6 +227,7 @@ void SaveUserConfig(const DriverUserConfig& cfg) {
     HKEY hKey = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kUserSettingsKey, 0, nullptr, 0, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS) {
         DWORD excl = cfg.useExclusiveMode ? 1 : 0;
+        DWORD ivol = cfg.ignoreWindowsVolume ? 1 : 0;
         DWORD inp  = cfg.enableInputCapture ? 1 : 0;
         DWORD buf  = static_cast<DWORD>(cfg.customBufferFrames);
         DWORD sr   = static_cast<DWORD>(cfg.preferredSampleRate);
@@ -184,6 +236,7 @@ void SaveUserConfig(const DriverUserConfig& cfg) {
         DWORD chI  = static_cast<DWORD>(cfg.numChannelsIn);
 
         RegSetValueExW(hKey, L"ExclusiveMode", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&excl), sizeof(DWORD));
+        RegSetValueExW(hKey, L"IgnoreWindowsVolume", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&ivol), sizeof(DWORD));
         RegSetValueExW(hKey, L"EnableInput", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&inp), sizeof(DWORD));
         RegSetValueExW(hKey, L"CustomBufferFrames", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&buf), sizeof(DWORD));
         RegSetValueExW(hKey, L"SampleRate", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&sr), sizeof(DWORD));
@@ -235,10 +288,10 @@ namespace Layout {
     constexpr int Pad       = 16;
     constexpr int InnerW    = ColW - 2 * Pad;              // 318
     constexpr int Top       = HeaderH + 16;                // 92
-    constexpr int Bottom    = 404;                         // base das colunas
-    constexpr int FooterTop = Bottom + Margin;             // 424
+    constexpr int Bottom    = 440;                         // base das colunas
+    constexpr int FooterTop = Bottom + Margin;             // 460
     constexpr int FooterH   = 56;
-    constexpr int ClientH   = FooterTop + FooterH;         // 480
+    constexpr int ClientH   = FooterTop + FooterH;         // 516
     constexpr int LblH      = 18;
     constexpr int BtnH      = 30;
     constexpr int ComboDrop = 300;                         // altura da lista aberta
@@ -253,9 +306,9 @@ namespace Palette {
     constexpr COLORREF MutedText  = RGB(104, 104, 104);
     constexpr COLORREF FooterBg   = RGB(243, 243, 243);
     constexpr COLORREF FooterLine = RGB(223, 223, 223);
-    constexpr COLORREF LatGood    = RGB(72, 207, 133);   // <= 10 ms
-    constexpr COLORREF LatOk      = RGB(255, 191, 71);   // <= 25 ms
-    constexpr COLORREF LatHigh    = RGB(255, 112, 92);   //  > 25 ms
+    constexpr COLORREF LatGood    = RGB(72, 207, 133);   // <= 40 ms
+    constexpr COLORREF LatOk      = RGB(255, 191, 71);   // <= 60 ms
+    constexpr COLORREF LatHigh    = RGB(255, 112, 92);   //  > 60 ms
     // Botão principal ("Salvar e aplicar"): azul de destaque do Windows
     constexpr COLORREF Accent        = RGB(0, 95, 184);
     constexpr COLORREF AccentHover   = RGB(25, 117, 197);
@@ -270,10 +323,8 @@ struct DialogState {
     std::vector<AudioDeviceEntry> outputDevices;
     std::vector<AudioDeviceEntry> inputDevices;
     bool                          inDawMode    = false;
-    double                        nativeRate   = 48000.0;
-    long                          hwMin        = 64;
-    long                          hwDef        = 256;
-    long                          hwMax        = 2048;
+    long                          mixRate      = 48000;  // taxa do Windows na saída escolhida
+    long                          autoBuffer   = 256;    // tamanho usado em "Automático"
     bool                          applied      = false;
     bool                          isOpen       = true;
     bool                          saveHover    = false;  // mouse sobre "Salvar e aplicar"
@@ -353,25 +404,26 @@ static void UpdateLatencyDisplay(HWND hWnd, DialogState* pState) {
     int bufIdx = (int)SendMessageW(hCmbBuf, CB_GETCURSEL, 0, 0);
     long selFrames = (long)SendMessageW(hCmbBuf, CB_GETITEMDATA, bufIdx, 0);
     const bool isAuto = (selFrames <= 0);
-    long bufFrames = isAuto ? pState->hwDef : selFrames;
-    if (bufFrames <= 0) bufFrames = 256;
+    long bufFrames = isAuto ? pState->autoBuffer : selFrames;
 
     int srIdx = (int)SendMessageW(hCmbSr, CB_GETCURSEL, 0, 0);
     long sr = (long)SendMessageW(hCmbSr, CB_GETITEMDATA, srIdx, 0);
-    if (sr <= 0) sr = 48000;
+    if (sr <= 0) sr = pState->mixRate;
 
     int modIdx = (int)SendMessageW(hCmbMod, CB_GETCURSEL, 0, 0);
-    long mode = (long)SendMessageW(hCmbMod, CB_GETITEMDATA, modIdx, 0);
+    const bool exclusive = (SendMessageW(hCmbMod, CB_GETITEMDATA, modIdx, 0) == 1);
 
-    const double oneWayMs    = (static_cast<double>(bufFrames) * 1000.0) / static_cast<double>(sr);
-    const double roundTripMs = oneWayMs * 2.0;
+    // Além do buffer, conta o que o Windows acrescenta (período do mixer, fila e FIFO de entrada)
+    const LatencyEstimate est = EstimateLatency(bufFrames, sr, exclusive);
+    const double oneWayMs     = (static_cast<double>(bufFrames) * 1000.0) / static_cast<double>(sr);
+    const double roundTripMs  = (static_cast<double>(est.inputFrames + est.outputFrames) * 1000.0) / static_cast<double>(sr);
 
     // Leitura grande no cabeçalho
-    std::swprintf(pState->readoutText, 32, L"%.1f ms", roundTripMs);
-    std::swprintf(pState->readoutCaption, 128, L"latência ida e volta  ·  modo %ls",
-                  (mode == 1) ? L"exclusivo" : L"compartilhado");
-    pState->readoutColor = (roundTripMs <= 10.0) ? Palette::LatGood
-                         : (roundTripMs <= 25.0) ? Palette::LatOk
+    std::swprintf(pState->readoutText, 32, L"%.0f ms", roundTripMs);
+    std::swprintf(pState->readoutCaption, 128, L"latência mínima de ida e volta  ·  modo %ls",
+                  exclusive ? L"exclusivo" : L"compartilhado");
+    pState->readoutColor = (roundTripMs <= 40.0) ? Palette::LatGood
+                         : (roundTripMs <= 60.0) ? Palette::LatOk
                                                  : Palette::LatHigh;
     RECT rcHeader = HeaderRect(hWnd, pState);
     InvalidateRect(hWnd, &rcHeader, TRUE);
@@ -389,6 +441,50 @@ static void UpdateLatencyDisplay(HWND hWnd, DialogState* pState) {
         SendMessageW(GetDlgItem(hWnd, q.id), BM_SETCHECK,
                      (!isAuto && q.frames == selFrames) ? BST_CHECKED : BST_UNCHECKED, 0);
     }
+}
+
+// Dispositivo de saída escolhido na lista ("" = padrão do Windows)
+static std::wstring SelectedOutputId(HWND hWnd, const DialogState* st) {
+    HWND hCmb = GetDlgItem(hWnd, IDC_CMB_OUT_DEV);
+    const int sel = (int)SendMessageW(hCmb, CB_GETCURSEL, 0, 0);
+    const int dev = (int)SendMessageW(hCmb, CB_GETITEMDATA, sel, 0);
+    return (dev >= 0 && dev < (int)st->outputDevices.size()) ? st->outputDevices[dev].id : std::wstring();
+}
+
+// Mostra o efeito do volume do Windows sobre o áudio da DAW.
+static void UpdateVolumeStatus(HWND hWnd, DialogState* st, bool withMixRate = true) {
+    const OutputDeviceInfo info = QueryOutputDevice(SelectedOutputId(hWnd, st), withMixRate);
+    if (info.mixRate > 0) st->mixRate = info.mixRate;
+
+    HWND hCmbMod = GetDlgItem(hWnd, IDC_CMB_WASAPI_MODE);
+    const int modIdx = (int)SendMessageW(hCmbMod, CB_GETCURSEL, 0, 0);
+    const bool exclusive = (SendMessageW(hCmbMod, CB_GETITEMDATA, modIdx, 0) == 1);
+    const bool ignore    = (SendMessageW(GetDlgItem(hWnd, IDC_CHK_IGNORE_VOL), BM_GETCHECK, 0, 0) == BST_CHECKED);
+    EnableWindow(GetDlgItem(hWnd, IDC_CHK_IGNORE_VOL), exclusive ? FALSE : TRUE);
+
+    const nanoAudioVolume::EndpointVolume& v = info.volume;
+    const int percent = static_cast<int>(v.scalar * 100.0f + 0.5f);
+    wchar_t text[160] = {};
+    if (!v.valid) {
+        text[0] = L'\0';
+    } else if (!v.software) {
+        std::swprintf(text, 160, L"Volume no próprio dispositivo (%d%%): nada a compensar", percent);
+    } else if (exclusive) {
+        std::swprintf(text, 160, L"Modo exclusivo: o volume do Windows não se aplica");
+    } else if (v.muted || v.scalar < 0.005f) {
+        std::swprintf(text, 160, L"Windows no mudo: a saída fica sem som");
+    } else if (ignore && -v.db > nanoAudioVolume::kMaxMakeupDb) {
+        std::swprintf(text, 160, L"Windows em %d%%: compensado só até +%.0f dB", percent, nanoAudioVolume::kMaxMakeupDb);
+    } else if (ignore) {
+        std::swprintf(text, 160, L"Windows em %d%% (%.1f dB): compensado pelo driver", percent, v.db);
+    } else {
+        std::swprintf(text, 160, L"Windows em %d%%: o áudio sai %.1f dB mais baixo", percent, -v.db);
+    }
+
+    HWND hStatus = GetDlgItem(hWnd, IDC_STATUS_VOLUME);
+    wchar_t current[160] = {};
+    GetWindowTextW(hStatus, current, 160);
+    if (std::wcscmp(current, text) != 0) SetWindowTextW(hStatus, text);
 }
 
 static void SelectBufferByFrames(HWND hWnd, DialogState* pState, long frames) {
@@ -562,13 +658,16 @@ static void CreatePanelControls(HWND hWnd, DialogState* st) {
 
     // ---- COLUNA ESQUERDA: SAÍDA ----------------------------------------
     int y = Top;
-    const int outH = 137;
+    const int outH = 172;
     AddControl(hWnd, st, L"BUTTON", L"Saída de áudio", BS_GROUPBOX,
                ColL, y, ColW, outH, IDC_GRP_OUTPUT, st->hFontBold);
     AddLabel(hWnd, st, L"Dispositivo de saída", xL, y + 24, InnerW, IDC_LBL_OUT_DEV);
     AddCombo(hWnd, st, xL, y + 43, InnerW, IDC_CMB_OUT_DEV);
     AddLabel(hWnd, st, L"Canais de saída", xL, y + 76, InnerW, IDC_LBL_OUT_CH);
     AddCombo(hWnd, st, xL, y + 95, 210, IDC_CMB_OUT_CH);
+    AddControl(hWnd, st, L"BUTTON", L"Ignorar o volume do Windows (nível igual ao WDM)",
+               BS_AUTOCHECKBOX | WS_TABSTOP, xL, y + 127, InnerW, 20, IDC_CHK_IGNORE_VOL, st->hFontNormal);
+    AddLabel(hWnd, st, L"", xL + 17, y + 148, InnerW - 17, IDC_STATUS_VOLUME, st->hFontSmall);
 
     // ---- COLUNA ESQUERDA: ENTRADA --------------------------------------
     y = Top + outH + 12;
@@ -617,6 +716,8 @@ static void CreatePanelControls(HWND hWnd, DialogState* st) {
     AddCombo(hWnd, st, xR + halfW + 14, y + 43, halfW, IDC_CMB_BIT_DEPTH);
     AddLabel(hWnd, st, L"Modo de operação", xR, y + 76, InnerW, IDC_LBL_WASAPI_MODE);
     AddCombo(hWnd, st, xR, y + 95, InnerW, IDC_CMB_WASAPI_MODE);
+    AddControl(hWnd, st, L"STATIC", L"A resolução vale para o modo exclusivo. No compartilhado o áudio "
+               L"vai ao Windows em 32-bit float.", SS_LEFT | SS_NOPREFIX, xR, y + 128, InnerW, 34, IDC_LBL_MODE_HINT, st->hFontSmall);
 
     // ---- RODAPÉ ---------------------------------------------------------
     const int by = FooterTop + (FooterH - BtnH) / 2;
@@ -678,6 +779,9 @@ static void PopulatePanelControls(HWND hWnd, DialogState* st) {
     }
     SendMessageW(hCmbOutCh, CB_SETCURSEL, selOutCh, 0);
 
+    // Volume do Windows
+    SendMessageW(GetDlgItem(hWnd, IDC_CHK_IGNORE_VOL), BM_SETCHECK, cfg.ignoreWindowsVolume ? BST_CHECKED : BST_UNCHECKED, 0);
+
     // Habilitar Entrada
     SendMessageW(hChkIn, BM_SETCHECK, cfg.enableInputCapture ? BST_CHECKED : BST_UNCHECKED, 0);
 
@@ -707,12 +811,12 @@ static void PopulatePanelControls(HWND hWnd, DialogState* st) {
 
     SetInputControlsEnabled(hWnd, cfg.enableInputCapture);
 
-    // Sample Rates (a ordem importa: "Restaurar padrões" seleciona o índice 1 = 48 kHz)
-    const long sampleRates[] = { 44100, 48000, 88200, 96000, 192000 };
-    int selSr = 1;
-    for (int i = 0; i < 5; ++i) {
-        wchar_t khz[24];
-        FormatKHz(khz, 24, sampleRates[i]);
+    // Sample Rates (a ordem importa: "Restaurar padrões" seleciona o índice 0 = automático)
+    const long sampleRates[] = { 0, 44100, 48000, 88200, 96000, 192000 };
+    int selSr = 0;
+    for (int i = 0; i < 6; ++i) {
+        wchar_t khz[32] = L"Automático (Windows)";
+        if (sampleRates[i] > 0) FormatKHz(khz, 32, sampleRates[i]);
         idx = (int)SendMessageW(hCmbSr, CB_ADDSTRING, 0, (LPARAM)khz);
         SendMessageW(hCmbSr, CB_SETITEMDATA, idx, (LPARAM)sampleRates[i]);
         if (cfg.preferredSampleRate == sampleRates[i]) selSr = idx;
@@ -760,6 +864,7 @@ static void PopulatePanelControls(HWND hWnd, DialogState* st) {
     SendMessageW(hCmbMode, CB_SETITEMDATA, idx, (LPARAM)1);
     SendMessageW(hCmbMode, CB_SETCURSEL, cfg.useExclusiveMode ? 1 : 0, 0);
 
+    UpdateVolumeStatus(hWnd, st);   // também descobre a taxa do Windows usada abaixo
     UpdateLatencyDisplay(hWnd, st);
 }
 
@@ -801,9 +906,17 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
         CreatePanelControls(hWnd, pState);
         PopulatePanelControls(hWnd, pState);
+        SetTimer(hWnd, kVolumeTimerId, 1000, nullptr);   // acompanha o controle de volume do Windows
         PostMessageW(hWnd, kMsgCheckPendingUpdate, 0, 0);
         return 0;
     }
+
+    case WM_TIMER:
+        if (wParam == kVolumeTimerId) {
+            UpdateVolumeStatus(hWnd, pState, false);
+            return 0;
+        }
+        break;
 
     case WM_DRAWITEM: {
         const DRAWITEMSTRUCT* dis = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
@@ -837,7 +950,9 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
         HDC hdc = reinterpret_cast<HDC>(wParam);
         SetBkColor(hdc, inFooter ? Palette::FooterBg : Palette::BodyBg);
-        SetTextColor(hdc, (GetDlgCtrlID(hCtl) == IDC_STATUS_LATENCY) ? Palette::MutedText : Palette::BodyText);
+        const int ctlId  = GetDlgCtrlID(hCtl);
+        const bool muted = (ctlId == IDC_STATUS_LATENCY || ctlId == IDC_STATUS_VOLUME || ctlId == IDC_LBL_MODE_HINT);
+        SetTextColor(hdc, muted ? Palette::MutedText : Palette::BodyText);
         return reinterpret_cast<LRESULT>(inFooter ? pState->hFooterBrush : pState->hBodyBrush);
     }
 
@@ -857,7 +972,12 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             SetInputControlsEnabled(hWnd, chk == BST_CHECKED);
         }
 
+        if (id == IDC_CHK_IGNORE_VOL && code == BN_CLICKED) {
+            UpdateVolumeStatus(hWnd, pState);
+        }
+
         if (code == CBN_SELCHANGE) {
+            if (id == IDC_CMB_OUT_DEV || id == IDC_CMB_WASAPI_MODE) UpdateVolumeStatus(hWnd, pState);
             UpdateLatencyDisplay(hWnd, pState);
         }
 
@@ -886,6 +1006,9 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 
             int selOutCh = (int)SendMessageW(hCmbOutCh, CB_GETCURSEL, 0, 0);
             pState->workingConfig.numChannelsOut = (long)SendMessageW(hCmbOutCh, CB_GETITEMDATA, selOutCh, 0);
+
+            pState->workingConfig.ignoreWindowsVolume =
+                (SendMessageW(GetDlgItem(hWnd, IDC_CHK_IGNORE_VOL), BM_GETCHECK, 0, 0) == BST_CHECKED);
 
             // Entrada
             pState->workingConfig.enableInputCapture = (SendMessageW(hChkIn, BM_GETCHECK, 0, 0) == BST_CHECKED);
@@ -936,7 +1059,7 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             return 0;
         }
 
-        if (id == IDC_BTN_CANCEL) {
+        if (id == IDC_BTN_CANCEL || id == IDCANCEL) {   // IDCANCEL = tecla Esc
             DestroyWindow(hWnd);
             return 0;
         }
@@ -947,11 +1070,13 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             SendMessageW(GetDlgItem(hWnd, IDC_CHK_ENABLE_IN), BM_SETCHECK, BST_CHECKED, 0);
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_IN_DEV), CB_SETCURSEL, 0, 0);
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_IN_CH), CB_SETCURSEL, 1, 0);
-            SendMessageW(GetDlgItem(hWnd, IDC_CMB_SAMPLE_RATE), CB_SETCURSEL, 1, 0); // 48000
+            SendMessageW(GetDlgItem(hWnd, IDC_CHK_IGNORE_VOL), BM_SETCHECK, BST_CHECKED, 0);
+            SendMessageW(GetDlgItem(hWnd, IDC_CMB_SAMPLE_RATE), CB_SETCURSEL, 0, 0); // Automático
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_BIT_DEPTH), CB_SETCURSEL, 0, 0); // 32-bit Float
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_BUFFER_SIZE), CB_SETCURSEL, 0, 0); // Auto
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_WASAPI_MODE), CB_SETCURSEL, 0, 0); // Shared
             SetInputControlsEnabled(hWnd, true);
+            UpdateVolumeStatus(hWnd, pState);
             UpdateLatencyDisplay(hWnd, pState);
             return 0;
         }
@@ -963,6 +1088,7 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         return 0;
 
     case WM_DESTROY: {
+        KillTimer(hWnd, kVolumeTimerId);
         HFONT fonts[] = { pState->hFontNormal, pState->hFontBold, pState->hFontSmall,
                           pState->hFontTitle, pState->hFontReadout };
         for (HFONT f : fonts) if (f) DeleteObject(f);
@@ -1263,10 +1389,7 @@ bool ShowControlPanelWindow(
     HWND hWndParent,
     DriverUserConfig* inOutConfig,
     bool inDawMode,
-    double nativeMixRate,
-    long hwMinFrames,
-    long hwDefFrames,
-    long hwMaxFrames
+    long autoBufferFrames
 ) {
     DialogState state;
     state.targetConfig  = inOutConfig;
@@ -1274,10 +1397,7 @@ bool ShowControlPanelWindow(
     state.outputDevices = EnumerateAudioDevices(eRender);
     state.inputDevices  = EnumerateAudioDevices(eCapture);
     state.inDawMode     = inDawMode;
-    state.nativeRate    = nativeMixRate;
-    state.hwMin         = hwMinFrames;
-    state.hwDef         = hwDefFrames;
-    state.hwMax         = hwMaxFrames;
+    state.autoBuffer    = (autoBufferFrames > 0) ? autoBufferFrames : 256;
     state.applied       = false;
     state.isOpen        = true;
 
@@ -1357,18 +1477,18 @@ bool ShowControlPanelWindow(
     SetActiveWindow(hWnd);
     UpdateWindow(hWnd);
 
-    // Modal message loop seguro (não usa PostQuitMessage que fecharia a DAW)
-    MSG msg;
-    while (state.isOpen && GetMessageW(&msg, nullptr, 0, 0)) {
-        if (msg.message == WM_QUIT) {
-            PostQuitMessage((int)msg.wParam);
-            break;
-        }
+    // Loop modal (não usa PostQuitMessage, que fecharia a DAW). GetMessage devolve 0 ao receber
+    // WM_QUIT: a mensagem precisa voltar para a fila, ou a DAW não conseguiria encerrar.
+    MSG msg = {};
+    BOOL got = TRUE;
+    while (state.isOpen && (got = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         if (!IsDialogMessageW(hWnd, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
     }
+    if (state.isOpen) DestroyWindow(hWnd);   // "state" está na pilha: a janela não pode sobreviver a ele
+    if (got == 0) PostQuitMessage(static_cast<int>(msg.wParam));
 
     if (hWndParent && IsWindow(hWndParent)) {
         EnableWindow(hWndParent, TRUE);

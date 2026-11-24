@@ -1,6 +1,6 @@
 // ============================================================================
 // nanoAudioConfigMain.cpp
-// Executável Autônomo do Painel de Controle (Standalone App) — nanoAudio (v2.5)
+// Executável Autônomo do Painel de Controle (Standalone App) — nanoAudio
 // Universal WASAPI Low-Latency ASIO Driver
 // ============================================================================
 

@@ -7,6 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_library(nanoAudioDriver SHARED
     nanoAudioDriver.h
     nanoAudioDriver.cpp
+    nanoAudioCaptureFifo.h
+    nanoAudioVolume.h
     nanoAudioConfig.h
     nanoAudioConfig.cpp
     nanoAudioDriver.def
@@ -32,7 +34,7 @@ target_link_libraries(nanoAudioDriver PRIVATE
 )
 
 if(MSVC)
-    target_compile_options(nanoAudioDriver PRIVATE /W4 /O2 /EHsc)
+    target_compile_options(nanoAudioDriver PRIVATE /W4 /O2 /EHsc /utf-8)
 endif()
 
 # Atualizador automático (executável separado)
