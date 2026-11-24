@@ -38,8 +38,8 @@ where clang++ >nul 2>&1
 if %errorLevel% equ 0 (
     echo [INFO] Compilador Clang/LLVM-MinGW detectado...
     echo [INFO] Compilando nanoAudioDriver.dll ^(64-bit Release Estatico^)...
-    clang++ -target x86_64-w64-windows-gnu -shared -O2 -std=c++17 -static -DUNICODE -D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp nanoAudioDriver.def -lole32 -luuid -lavrt -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lksuser -o "%~dp0%DLL_NAME%"
-    clang++ -target i686-w64-windows-gnu -shared -O2 -std=c++17 -static -DUNICODE -D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp nanoAudioDriver.def -lole32 -luuid -lavrt -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lksuser -o "%~dp0%DLL32_NAME%"
+    clang++ -target x86_64-w64-windows-gnu -shared -O2 -std=c++17 -static -DUNICODE -D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp nanoAudioDriver.def -lole32 -luuid -lavrt -lwinmm -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lksuser -o "%~dp0%DLL_NAME%"
+    clang++ -target i686-w64-windows-gnu -shared -O2 -std=c++17 -static -DUNICODE -D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp nanoAudioDriver.def -lole32 -luuid -lavrt -lwinmm -luser32 -lgdi32 -ladvapi32 -lcomctl32 -lksuser -o "%~dp0%DLL32_NAME%"
     clang++ -target x86_64-w64-windows-gnu -O2 -std=c++17 -static -mwindows -municode -DUNICODE -D_UNICODE nanoAudioConfigMain.cpp nanoAudioConfig.cpp -lole32 -luuid -luser32 -lgdi32 -ladvapi32 -lcomctl32 -o "%~dp0%PANEL_EXE%"
     if exist "%~dp0%DLL_NAME%" (
         set "BUILT_DLL=%~dp0%DLL_NAME%"
@@ -62,8 +62,8 @@ if defined VCVARS (
     echo [INFO] Compilador MSVC encontrado: "!VCVARS!"
     call "!VCVARS!" >nul
     echo [INFO] Compilando nanoAudioDriver.dll ^(64-bit Release^)...
-    cl /nologo /LD /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp ole32.lib uuid.lib avrt.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ksuser.lib /link /DEF:nanoAudioDriver.def /OUT:"%~dp0%DLL_NAME%"
-    cl /nologo /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioConfigMain.cpp nanoAudioConfig.cpp ole32.lib uuid.lib user32.lib gdi32.lib advapi32.lib comctl32.lib /link /SUBSYSTEM:WINDOWS /OUT:"%~dp0%PANEL_EXE%"
+    cl /nologo /LD /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp ole32.lib uuid.lib avrt.lib winmm.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ksuser.lib /link /DEF:nanoAudioDriver.def /OUT:"%~dp0%DLL_NAME%"
+    cl /nologo /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE nanoAudioConfigMain.cpp nanoAudioConfig.cpp ole32.lib uuid.lib user32.lib gdi32.lib advapi32.lib comctl32.lib /link /SUBSYSTEM:WINDOWS /OUT:"%~dp0%PANEL_EXE%"
     if exist "%~dp0%DLL_NAME%" (
         set "BUILT_DLL=%~dp0%DLL_NAME%"
         goto :INSTALL_STEP

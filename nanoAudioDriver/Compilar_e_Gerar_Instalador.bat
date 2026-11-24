@@ -75,11 +75,11 @@ if "%COMPILER%"=="CLANG" (
         goto :FAIL
     )
     call "!VCVARS64!" >nul
-    cl /nologo /LD /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp ole32.lib uuid.lib avrt.lib winmm.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ksuser.lib /link /DEF:nanoAudioDriver.def /OUT:nanoAudioDriver.dll
+    cl /nologo /LD /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE nanoAudioDriver.cpp nanoAudioConfig.cpp ole32.lib uuid.lib avrt.lib winmm.lib user32.lib gdi32.lib advapi32.lib comctl32.lib ksuser.lib /link /DEF:nanoAudioDriver.def /OUT:nanoAudioDriver.dll
     if !errorLevel! neq 0 ( echo [ERRO] Falha ao compilar DLL com MSVC. & goto :FAIL )
-    cl /nologo /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioConfigMain.cpp nanoAudioConfig.cpp ole32.lib uuid.lib user32.lib gdi32.lib advapi32.lib comctl32.lib /link /SUBSYSTEM:WINDOWS /OUT:nanoAudioControlPanel.exe
+    cl /nologo /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE nanoAudioConfigMain.cpp nanoAudioConfig.cpp ole32.lib uuid.lib user32.lib gdi32.lib advapi32.lib comctl32.lib /link /SUBSYSTEM:WINDOWS /OUT:nanoAudioControlPanel.exe
     if !errorLevel! neq 0 ( echo [ERRO] Falha ao compilar o Painel com MSVC. & goto :FAIL )
-    cl /nologo /O2 /EHsc /DUNICODE /D_UNICODE nanoAudioUpdater.cpp winhttp.lib bcrypt.lib rstrtmgr.lib shell32.lib user32.lib advapi32.lib /link /SUBSYSTEM:WINDOWS /OUT:nanoAudioUpdater.exe
+    cl /nologo /O2 /EHsc /std:c++17 /utf-8 /DUNICODE /D_UNICODE nanoAudioUpdater.cpp winhttp.lib bcrypt.lib rstrtmgr.lib shell32.lib user32.lib advapi32.lib /link /SUBSYSTEM:WINDOWS /OUT:nanoAudioUpdater.exe
     if !errorLevel! neq 0 ( echo [ERRO] Falha ao compilar o Atualizador com MSVC. & goto :FAIL )
 ) else (
     if defined NANO_RELEASE (
