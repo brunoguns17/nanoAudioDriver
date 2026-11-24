@@ -66,20 +66,6 @@ static void NanoLog(const wchar_t* fmt, ...) {
     std::fclose(f);
 }
 
-static bool ContainsIgnoreCase(const wchar_t* haystack, const wchar_t* needle) {
-    if (!haystack || !needle || !*needle) return false;
-    for (; *haystack; ++haystack) {
-        const wchar_t* h = haystack;
-        const wchar_t* n = needle;
-        while (*h && *n && std::towlower(*h) == std::towlower(*n)) {
-            ++h;
-            ++n;
-        }
-        if (!*n) return true;
-    }
-    return false;
-}
-
 // ============================================================================
 // 1. IMPLEMENTAÇÃO DOS MÉTODOS DA INTERFACE IASIO (NANOAUDIO)
 // ============================================================================
@@ -396,153 +382,21 @@ void UniversalWasapiAsioDriver::RequestHostReset() {
     if (HostSupports(kAsioResetRequest)) m_callbacks.asioMessage(kAsioResetRequest, 0, nullptr, nullptr);
 }
 
-// Comportamento aprendido por dispositivo (em microssegundos), no Registro. Evita repetir a cada
-// abertura da DAW o estalo que ensinou que aquele driver precisa de mais folga, e permite informar a
-// latência certa já no createBuffers(), antes de o áudio rodar. Os limites impedem que um travamento
-// isolado do PC deixe a latência alta para sempre.
-struct DeviceTuning { const wchar_t* shared; const wchar_t* exclusive; LONG minUs, maxUs; };
-static const DeviceTuning kTuneBurst    = { L"SharedBurstUs",    L"ExclusiveBurstUs",         0,  21000 };
-static const DeviceTuning kTuneMargin   = { L"SharedMarginUs",   L"ExclusiveMarginUs",        0,  12000 };
-static const DeviceTuning kTuneOutExtra = { L"SharedOutExtraUs", L"ExclusiveOutExtraUs", -40000, 200000 };
-static const DeviceTuning kTuneInExtra  = { L"SharedInExtraUs",  L"ExclusiveInExtraUs",  -40000, 200000 };
-
-static std::wstring EndpointId(IMMDevice* dev) {
-    std::wstring id;
-    LPWSTR p = nullptr;
-    if (dev && SUCCEEDED(dev->GetId(&p)) && p) {
-        id = p;
-        CoTaskMemFree(p);
-    }
-    return id;
-}
-
-static std::wstring DeviceTuningKey(const std::wstring& id) {
-    return std::wstring(kUserSettingsKey) + L"\\Devices\\" + id;
-}
-
-// Retorna em frames (0 = nada aprendido)
-static long LoadDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double sampleRate) {
-    DWORD value = 0, size = sizeof(value);
-    if (id.empty() || RegGetValueW(HKEY_CURRENT_USER, DeviceTuningKey(id).c_str(), exclusive ? t.exclusive : t.shared,
-                                   RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS) return 0;
-    const LONG us = std::clamp(static_cast<LONG>(value), t.minUs, t.maxUs);
-    return static_cast<long>(us * sampleRate / 1e6);
-}
-
-static void SaveDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double frames, double sampleRate) {
-    HKEY h = nullptr;
-    if (id.empty() || RegCreateKeyExW(HKEY_CURRENT_USER, DeviceTuningKey(id).c_str(), 0, nullptr, 0, KEY_WRITE,
-                                      nullptr, &h, nullptr) != ERROR_SUCCESS) return;
-    const double us    = std::clamp(frames * 1e6 / sampleRate, static_cast<double>(t.minUs), static_cast<double>(t.maxUs));
-    const DWORD  value = static_cast<DWORD>(static_cast<LONG>(us));
-    RegSetValueExW(h, exclusive ? t.exclusive : t.shared, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
-    RegCloseKey(h);
-}
-
-// Latência a informar antes de abrir os streams: a prevista mais o que se mediu nesse dispositivo.
+// Latência a informar antes de abrir os streams (a mesma conta que o painel mostra).
 void UniversalWasapiAsioDriver::UpdateLatencyEstimate(long blockFrames) {
-    const double rate      = m_sampleRate.load();
-    const bool   exclusive = m_config.useExclusiveMode;
-    const LatencyEstimate e = EstimateLatency(blockFrames, rate, exclusive);
-    m_inputLatencyFrames  = std::max(blockFrames, e.inputFrames  + LoadDeviceTuning(m_captureId, kTuneInExtra, exclusive, rate));
-    m_outputLatencyFrames = std::max(blockFrames, e.outputFrames + LoadDeviceTuning(m_renderId, kTuneOutExtra, exclusive, rate));
+    const LatencyEstimate e = PredictLatency(blockFrames, m_sampleRate.load(), m_config.useExclusiveMode, m_renderId, m_captureId);
+    m_inputLatencyFrames  = e.inputFrames;
+    m_outputLatencyFrames = e.outputFrames;
 }
 
 // ============================================================================
 // 3. DESCOBERTA E SELEÇÃO DE DISPOSITIVOS DE ENTRADA (MESA USB) E SAÍDA
 // ============================================================================
 
-void UniversalWasapiAsioDriver::GetEndpointFriendlyName(IMMDevice* pDevice, wchar_t* outName, size_t maxLen) {
-    if (!outName || maxLen == 0) return;
-    std::wcsncpy(outName, L"Dispositivo de Áudio", maxLen - 1);
-    outName[maxLen - 1] = L'\0';
-    if (!pDevice) return;
-
-    IPropertyStore* pProps = nullptr;
-    if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
-        PROPVARIANT varName;
-        PropVariantInit(&varName);
-        if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.vt == VT_LPWSTR && varName.pwszVal) {
-            std::wcsncpy(outName, varName.pwszVal, maxLen - 1);
-            outName[maxLen - 1] = L'\0';
-        }
-        PropVariantClear(&varName);
-        pProps->Release();
-    }
-}
-
-IMMDevice* UniversalWasapiAsioDriver::ResolveEndpoint(
-    IMMDeviceEnumerator* pEnum,
-    EDataFlow dataFlow,
-    const wchar_t* preferredId,
-    bool preferUsbForInput,
-    wchar_t* outName,
-    size_t maxNameLen) {
-    if (!pEnum) return nullptr;
-    IMMDevice* pResult = nullptr;
-
-    // 1. Se o usuário escolheu um dispositivo específico no Painel de Controle do nanoAudio,
-    //    verifica obrigatoriamente se ele está ATIVO (DEVICE_STATE_ACTIVE).
-    //    Quando a mesa muda de porta USB, o Windows cria um novo GUID ("2- BEHRINGER...") e o
-    //    GUID antigo fica NOTPRESENT/UNPLUGGED, mas GetDevice() ainda retornaria S_OK!
-    if (preferredId && preferredId[0] != L'\0') {
-        if (SUCCEEDED(pEnum->GetDevice(preferredId, &pResult)) && pResult) {
-            DWORD devState = 0;
-            if (SUCCEEDED(pResult->GetState(&devState)) && devState == DEVICE_STATE_ACTIVE) {
-                GetEndpointFriendlyName(pResult, outName, maxNameLen);
-                return pResult;
-            }
-            wchar_t staleName[128] = {};
-            GetEndpointFriendlyName(pResult, staleName, 128);
-            NanoLog(L"Dispositivo salvo inativo/desconectado: '%ls' (state=0x%lX). Usando fallback ativo.",
-                    staleName, static_cast<unsigned long>(devState));
-            pResult->Release();
-            pResult = nullptr;
-        }
-    }
-
-    // 2. Se for entrada (eCapture) e estiver em modo automático, procura primeiro uma Mesa/Interface USB
-    if (dataFlow == eCapture && preferUsbForInput) {
-        IMMDeviceCollection* pCol = nullptr;
-        if (SUCCEEDED(pEnum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &pCol)) && pCol) {
-            UINT count = 0;
-            pCol->GetCount(&count);
-            for (UINT i = 0; i < count; ++i) {
-                IMMDevice* pDev = nullptr;
-                if (SUCCEEDED(pCol->Item(i, &pDev)) && pDev) {
-                    wchar_t name[128] = {};
-                    GetEndpointFriendlyName(pDev, name, 128);
-                    // CORREÇÃO: "Line"/"Linha" foram removidos porque capturavam a
-                    // "Entrada de linha (Realtek)" da placa-mãe no lugar da mesa USB.
-                    // A Behringer XENYX aparece como "Microfone (USB Audio CODEC)".
-                    const bool isOnboard = ContainsIgnoreCase(name, L"Realtek") ||
-                                           ContainsIgnoreCase(name, L"Stereo Mix") ||
-                                           ContainsIgnoreCase(name, L"Mixagem");
-                    if (!isOnboard &&
-                        (ContainsIgnoreCase(name, L"USB") || ContainsIgnoreCase(name, L"CODEC") ||
-                         ContainsIgnoreCase(name, L"Behringer") || ContainsIgnoreCase(name, L"XENYX") ||
-                         ContainsIgnoreCase(name, L"Mixer") || ContainsIgnoreCase(name, L"Mesa") ||
-                         ContainsIgnoreCase(name, L"Interface"))) {
-                        std::wcsncpy(outName, name, maxNameLen - 1);
-                        outName[maxNameLen - 1] = L'\0';
-                        pCol->Release();
-                        return pDev;
-                    }
-                    pDev->Release();
-                }
-            }
-            pCol->Release();
-        }
-    }
-
-    // 3. Usa o dispositivo padrão do Windows (eConsole ou eCommunications)
-    if (FAILED(pEnum->GetDefaultAudioEndpoint(dataFlow, eConsole, &pResult)) || !pResult) {
-        pEnum->GetDefaultAudioEndpoint(dataFlow, eCommunications, &pResult);
-    }
-    if (pResult) {
-        GetEndpointFriendlyName(pResult, outName, maxNameLen);
-    }
-    return pResult;
+// O dispositivo salvo pode ter mudado de porta USB (o Windows cria outro ID): registra e segue
+static void LogStaleEndpoint(const wchar_t* name, DWORD state) {
+    NanoLog(L"Dispositivo salvo inativo/desconectado: '%ls' (state=0x%lX). Usando fallback ativo.",
+            name, static_cast<unsigned long>(state));
 }
 
 bool UniversalWasapiAsioDriver::ProbeHardwareCapabilities() {
@@ -566,12 +420,12 @@ bool UniversalWasapiAsioDriver::ProbeHardwareCapabilities() {
     };
 
     wchar_t name[128] = {};
-    if (IMMDevice* pRender = ResolveEndpoint(pEnum, eRender, m_config.outputDeviceId, false, name, 128)) {
+    if (IMMDevice* pRender = ResolveAudioEndpoint(pEnum, eRender, m_config.outputDeviceId, name, 128, &LogStaleEndpoint)) {
         probe(pRender, &m_nativeMixRate, &m_numOutputs);
         m_renderId = EndpointId(pRender);
         pRender->Release();
     }
-    if (IMMDevice* pCapture = ResolveEndpoint(pEnum, eCapture, m_config.inputDeviceId, true, name, 128)) {
+    if (IMMDevice* pCapture = ResolveAudioEndpoint(pEnum, eCapture, m_config.inputDeviceId, name, 128, &LogStaleEndpoint)) {
         probe(pCapture, nullptr, &m_numInputs);
         m_captureId = EndpointId(pCapture);
         pCapture->Release();
@@ -1107,9 +961,9 @@ DWORD UniversalWasapiAsioDriver::RunRealTimeAudioLoop() {
     wchar_t renderName[128] = L"(nenhuma)", captureName[128] = L"(nenhuma)";
     if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
                                    __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum))) && pEnum) {
-        pRenderDevice = ResolveEndpoint(pEnum, eRender, cfg.outputDeviceId, false, renderName, 128);
+        pRenderDevice = ResolveAudioEndpoint(pEnum, eRender, cfg.outputDeviceId, renderName, 128, &LogStaleEndpoint);
         if (wantInput) {
-            pCaptureDevice = ResolveEndpoint(pEnum, eCapture, cfg.inputDeviceId, true, captureName, 128);
+            pCaptureDevice = ResolveAudioEndpoint(pEnum, eCapture, cfg.inputDeviceId, captureName, 128, &LogStaleEndpoint);
             if (!cfg.useExclusiveMode) SyncEndpointSampleRates(pRenderDevice, pCaptureDevice);
         }
     }

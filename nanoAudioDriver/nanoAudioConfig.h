@@ -54,6 +54,7 @@ inline long SharedRenderTarget(long blockFrames, long burstFrames, long periodFr
 struct LatencyEstimate {
     long inputFrames  = 0;
     long outputFrames = 0;
+    bool measured     = false;   // inclui o que o driver mediu nesses dispositivos
 };
 
 // Latência prevista com o período padrão de 10 ms do Windows. Com o áudio rodando o driver mede
@@ -65,6 +66,31 @@ inline LatencyEstimate EstimateLatency(long blockFrames, double sampleRate, bool
     e.outputFrames = exclusive ? blockFrames * 2 + period : SharedRenderTarget(blockFrames, period, period) + period;
     return e;
 }
+
+// Comportamento aprendido por dispositivo (em microssegundos), no Registro. Evita repetir a cada
+// abertura da DAW o estalo que ensinou que aquele driver precisa de mais folga, e permite informar a
+// latência certa já no createBuffers(), antes de o áudio rodar. Os limites impedem que um travamento
+// isolado do PC deixe a latência alta para sempre. A rajada vai até 30 ms (3 períodos do mixer): a
+// Behringer USB chega a precisar de ~26 ms.
+struct DeviceTuning { const wchar_t* shared; const wchar_t* exclusive; LONG minUs, maxUs; };
+inline const DeviceTuning kTuneBurst    = { L"SharedBurstUs",    L"ExclusiveBurstUs",         0,  30000 };
+inline const DeviceTuning kTuneMargin   = { L"SharedMarginUs",   L"ExclusiveMarginUs",        0,  12000 };
+inline const DeviceTuning kTuneOutExtra = { L"SharedOutExtraUs", L"ExclusiveOutExtraUs", -40000, 200000 };
+inline const DeviceTuning kTuneInExtra  = { L"SharedInExtraUs",  L"ExclusiveInExtraUs",  -40000, 200000 };
+
+long LoadDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double sampleRate, bool* found = nullptr);
+void SaveDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double frames, double sampleRate);
+
+// Latência que o driver informa à DAW (e que o painel mostra): a prevista mais a medida nos dispositivos.
+LatencyEstimate PredictLatency(long blockFrames, double sampleRate, bool exclusive,
+                               const std::wstring& renderId, const std::wstring& captureId);
+
+// Dispositivo que o driver vai usar: o escolhido, se estiver ativo; senão (entrada) uma mesa/interface
+// USB; senão o padrão do Windows. outName recebe o nome amigável.
+typedef void (*StaleEndpointFn)(const wchar_t* name, DWORD state);
+IMMDevice* ResolveAudioEndpoint(IMMDeviceEnumerator* pEnum, EDataFlow dataFlow, const wchar_t* preferredId,
+                                wchar_t* outName, size_t maxNameLen, StaleEndpointFn onStale = nullptr);
+std::wstring EndpointId(IMMDevice* dev);
 
 // Funções utilitárias
 std::vector<AudioDeviceEntry> EnumerateAudioDevices(EDataFlow flow);

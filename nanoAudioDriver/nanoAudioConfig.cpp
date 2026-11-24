@@ -12,6 +12,8 @@
 #include <commctrl.h>
 #include <functiondiscoverykeys_devpkey.h>
 #include <cstdio>
+#include <cwchar>
+#include <cwctype>
 #include <algorithm>
 #include <cmath>
 
@@ -116,6 +118,156 @@ std::vector<AudioDeviceEntry> EnumerateAudioDevices(EDataFlow flow) {
     }
     pEnum->Release();
     return devices;
+}
+
+// ============================================================================
+// SELEÇÃO DO DISPOSITIVO E COMPORTAMENTO APRENDIDO (usados pelo driver e pelo painel)
+// ============================================================================
+
+static bool ContainsIgnoreCase(const wchar_t* haystack, const wchar_t* needle) {
+    if (!haystack || !needle || !*needle) return false;
+    for (; *haystack; ++haystack) {
+        const wchar_t* h = haystack;
+        const wchar_t* n = needle;
+        while (*h && *n && std::towlower(*h) == std::towlower(*n)) {
+            ++h;
+            ++n;
+        }
+        if (!*n) return true;
+    }
+    return false;
+}
+
+static void GetEndpointFriendlyName(IMMDevice* pDevice, wchar_t* outName, size_t maxLen) {
+    if (!outName || maxLen == 0) return;
+    std::wcsncpy(outName, L"Dispositivo de Áudio", maxLen - 1);
+    outName[maxLen - 1] = L'\0';
+    if (!pDevice) return;
+
+    IPropertyStore* pProps = nullptr;
+    if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps)) && pProps) {
+        PROPVARIANT varName;
+        PropVariantInit(&varName);
+        if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName)) && varName.vt == VT_LPWSTR && varName.pwszVal) {
+            std::wcsncpy(outName, varName.pwszVal, maxLen - 1);
+            outName[maxLen - 1] = L'\0';
+        }
+        PropVariantClear(&varName);
+        pProps->Release();
+    }
+}
+
+IMMDevice* ResolveAudioEndpoint(IMMDeviceEnumerator* pEnum, EDataFlow dataFlow, const wchar_t* preferredId,
+                                wchar_t* outName, size_t maxNameLen, StaleEndpointFn onStale) {
+    if (!pEnum) return nullptr;
+    IMMDevice* pResult = nullptr;
+
+    // 1. Se o usuário escolheu um dispositivo específico no Painel de Controle do nanoAudio,
+    //    verifica obrigatoriamente se ele está ATIVO (DEVICE_STATE_ACTIVE).
+    //    Quando a mesa muda de porta USB, o Windows cria um novo GUID ("2- BEHRINGER...") e o
+    //    GUID antigo fica NOTPRESENT/UNPLUGGED, mas GetDevice() ainda retornaria S_OK!
+    if (preferredId && preferredId[0] != L'\0') {
+        if (SUCCEEDED(pEnum->GetDevice(preferredId, &pResult)) && pResult) {
+            DWORD devState = 0;
+            if (SUCCEEDED(pResult->GetState(&devState)) && devState == DEVICE_STATE_ACTIVE) {
+                GetEndpointFriendlyName(pResult, outName, maxNameLen);
+                return pResult;
+            }
+            wchar_t staleName[128] = {};
+            GetEndpointFriendlyName(pResult, staleName, 128);
+            if (onStale) onStale(staleName, devState);
+            pResult->Release();
+            pResult = nullptr;
+        }
+    }
+
+    // 2. Se for entrada (eCapture) e estiver em modo automático, procura primeiro uma Mesa/Interface USB
+    if (dataFlow == eCapture) {
+        IMMDeviceCollection* pCol = nullptr;
+        if (SUCCEEDED(pEnum->EnumAudioEndpoints(eCapture, DEVICE_STATE_ACTIVE, &pCol)) && pCol) {
+            UINT count = 0;
+            pCol->GetCount(&count);
+            for (UINT i = 0; i < count; ++i) {
+                IMMDevice* pDev = nullptr;
+                if (SUCCEEDED(pCol->Item(i, &pDev)) && pDev) {
+                    wchar_t name[128] = {};
+                    GetEndpointFriendlyName(pDev, name, 128);
+                    // CORREÇÃO: "Line"/"Linha" foram removidos porque capturavam a
+                    // "Entrada de linha (Realtek)" da placa-mãe no lugar da mesa USB.
+                    // A Behringer XENYX aparece como "Microfone (USB Audio CODEC)".
+                    const bool isOnboard = ContainsIgnoreCase(name, L"Realtek") ||
+                                           ContainsIgnoreCase(name, L"Stereo Mix") ||
+                                           ContainsIgnoreCase(name, L"Mixagem");
+                    if (!isOnboard &&
+                        (ContainsIgnoreCase(name, L"USB") || ContainsIgnoreCase(name, L"CODEC") ||
+                         ContainsIgnoreCase(name, L"Behringer") || ContainsIgnoreCase(name, L"XENYX") ||
+                         ContainsIgnoreCase(name, L"Mixer") || ContainsIgnoreCase(name, L"Mesa") ||
+                         ContainsIgnoreCase(name, L"Interface"))) {
+                        std::wcsncpy(outName, name, maxNameLen - 1);
+                        outName[maxNameLen - 1] = L'\0';
+                        pCol->Release();
+                        return pDev;
+                    }
+                    pDev->Release();
+                }
+            }
+            pCol->Release();
+        }
+    }
+
+    // 3. Usa o dispositivo padrão do Windows (eConsole ou eCommunications)
+    if (FAILED(pEnum->GetDefaultAudioEndpoint(dataFlow, eConsole, &pResult)) || !pResult) {
+        pEnum->GetDefaultAudioEndpoint(dataFlow, eCommunications, &pResult);
+    }
+    if (pResult) {
+        GetEndpointFriendlyName(pResult, outName, maxNameLen);
+    }
+    return pResult;
+}
+
+std::wstring EndpointId(IMMDevice* dev) {
+    std::wstring id;
+    LPWSTR p = nullptr;
+    if (dev && SUCCEEDED(dev->GetId(&p)) && p) {
+        id = p;
+        CoTaskMemFree(p);
+    }
+    return id;
+}
+
+static std::wstring DeviceTuningKey(const std::wstring& id) {
+    return std::wstring(kUserSettingsKey) + L"\\Devices\\" + id;
+}
+
+// Retorna em frames (0 = nada aprendido)
+long LoadDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double sampleRate, bool* found) {
+    DWORD value = 0, size = sizeof(value);
+    const bool ok = !id.empty() && RegGetValueW(HKEY_CURRENT_USER, DeviceTuningKey(id).c_str(), exclusive ? t.exclusive : t.shared,
+                                                RRF_RT_REG_DWORD, nullptr, &value, &size) == ERROR_SUCCESS;
+    if (found) *found = ok;
+    if (!ok) return 0;
+    const LONG us = std::clamp(static_cast<LONG>(value), t.minUs, t.maxUs);
+    return static_cast<long>(us * sampleRate / 1e6);
+}
+
+void SaveDeviceTuning(const std::wstring& id, const DeviceTuning& t, bool exclusive, double frames, double sampleRate) {
+    HKEY h = nullptr;
+    if (id.empty() || RegCreateKeyExW(HKEY_CURRENT_USER, DeviceTuningKey(id).c_str(), 0, nullptr, 0, KEY_WRITE,
+                                      nullptr, &h, nullptr) != ERROR_SUCCESS) return;
+    const double us    = std::clamp(frames * 1e6 / sampleRate, static_cast<double>(t.minUs), static_cast<double>(t.maxUs));
+    const DWORD  value = static_cast<DWORD>(static_cast<LONG>(us));
+    RegSetValueExW(h, exclusive ? t.exclusive : t.shared, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
+    RegCloseKey(h);
+}
+
+LatencyEstimate PredictLatency(long blockFrames, double sampleRate, bool exclusive,
+                               const std::wstring& renderId, const std::wstring& captureId) {
+    LatencyEstimate e = EstimateLatency(blockFrames, sampleRate, exclusive);
+    bool inFound = false, outFound = false;
+    e.inputFrames  = std::max(blockFrames, e.inputFrames  + LoadDeviceTuning(captureId, kTuneInExtra, exclusive, sampleRate, &inFound));
+    e.outputFrames = std::max(blockFrames, e.outputFrames + LoadDeviceTuning(renderId, kTuneOutExtra, exclusive, sampleRate, &outFound));
+    e.measured     = outFound && (inFound || captureId.empty());
+    return e;
 }
 
 // Volume do Windows e taxa do mixer do dispositivo de saída ("" = padrão do Windows)
@@ -306,9 +458,9 @@ namespace Palette {
     constexpr COLORREF MutedText  = RGB(104, 104, 104);
     constexpr COLORREF FooterBg   = RGB(243, 243, 243);
     constexpr COLORREF FooterLine = RGB(223, 223, 223);
-    constexpr COLORREF LatGood    = RGB(72, 207, 133);   // <= 40 ms
-    constexpr COLORREF LatOk      = RGB(255, 191, 71);   // <= 60 ms
-    constexpr COLORREF LatHigh    = RGB(255, 112, 92);   //  > 60 ms
+    constexpr COLORREF LatGood    = RGB(72, 207, 133);   // buffer <= 5 ms
+    constexpr COLORREF LatOk      = RGB(255, 191, 71);   // buffer <= 12,5 ms
+    constexpr COLORREF LatHigh    = RGB(255, 112, 92);   // buffer  > 12,5 ms
     // Botão principal ("Salvar e aplicar"): azul de destaque do Windows
     constexpr COLORREF Accent        = RGB(0, 95, 184);
     constexpr COLORREF AccentHover   = RGB(25, 117, 197);
@@ -325,6 +477,8 @@ struct DialogState {
     bool                          inDawMode    = false;
     long                          mixRate      = 48000;  // taxa do Windows na saída escolhida
     long                          autoBuffer   = 256;    // tamanho usado em "Automático"
+    std::wstring                  renderId;               // dispositivos que o driver vai usar de fato
+    std::wstring                  captureId;
     bool                          applied      = false;
     bool                          isOpen       = true;
     bool                          saveHover    = false;  // mouse sobre "Salvar e aplicar"
@@ -413,18 +567,19 @@ static void UpdateLatencyDisplay(HWND hWnd, DialogState* pState) {
     int modIdx = (int)SendMessageW(hCmbMod, CB_GETCURSEL, 0, 0);
     const bool exclusive = (SendMessageW(hCmbMod, CB_GETITEMDATA, modIdx, 0) == 1);
 
-    // Além do buffer, conta o que o Windows acrescenta (período do mixer, fila e FIFO de entrada)
-    const LatencyEstimate est = EstimateLatency(bufFrames, sr, exclusive);
-    const double oneWayMs     = (static_cast<double>(bufFrames) * 1000.0) / static_cast<double>(sr);
-    const double roundTripMs  = (static_cast<double>(est.inputFrames + est.outputFrames) * 1000.0) / static_cast<double>(sr);
+    // Total = o que o driver informa à DAW (a DAW mostra estes dois números)
+    const LatencyEstimate est = PredictLatency(bufFrames, sr, exclusive, pState->renderId, pState->captureId);
+    const double oneWayMs = (static_cast<double>(bufFrames) * 1000.0) / static_cast<double>(sr);
+    const int    inMs     = static_cast<int>(est.inputFrames * 1000.0 / sr + 0.5);
+    const int    outMs    = static_cast<int>(est.outputFrames * 1000.0 / sr + 0.5);
 
-    // Cabeçalho: o buffer em destaque e, abaixo, o total (a cor acompanha o total)
+    // Cabeçalho: o buffer em destaque (com a cor) e, abaixo, o total
     std::swprintf(pState->readoutText, 32, L"%.1f ms", oneWayMs);
-    std::swprintf(pState->readoutCaption, 128, L"por buffer  ·  total mínimo %.0f ms ida e volta (%ls)",
-                  roundTripMs, exclusive ? L"exclusivo" : L"compartilhado");
-    pState->readoutColor = (roundTripMs <= 40.0) ? Palette::LatGood
-                         : (roundTripMs <= 60.0) ? Palette::LatOk
-                                                 : Palette::LatHigh;
+    std::swprintf(pState->readoutCaption, 128, L"por buffer  ·  total %ls %d ms (entrada %d + saída %d)",
+                  est.measured ? L"medido" : L"mínimo", inMs + outMs, inMs, outMs);
+    pState->readoutColor = (oneWayMs <= 5.0)  ? Palette::LatGood
+                         : (oneWayMs <= 12.5) ? Palette::LatOk
+                                              : Palette::LatHigh;
     RECT rcHeader = HeaderRect(hWnd, pState);
     InvalidateRect(hWnd, &rcHeader, TRUE);
 
@@ -443,17 +598,36 @@ static void UpdateLatencyDisplay(HWND hWnd, DialogState* pState) {
     }
 }
 
-// Dispositivo de saída escolhido na lista ("" = padrão do Windows)
-static std::wstring SelectedOutputId(HWND hWnd, const DialogState* st) {
-    HWND hCmb = GetDlgItem(hWnd, IDC_CMB_OUT_DEV);
+// Dispositivo escolhido em uma das listas ("" = padrão do Windows)
+static std::wstring SelectedDeviceId(HWND hWnd, int comboId, const std::vector<AudioDeviceEntry>& devices) {
+    HWND hCmb = GetDlgItem(hWnd, comboId);
     const int sel = (int)SendMessageW(hCmb, CB_GETCURSEL, 0, 0);
     const int dev = (int)SendMessageW(hCmb, CB_GETITEMDATA, sel, 0);
-    return (dev >= 0 && dev < (int)st->outputDevices.size()) ? st->outputDevices[dev].id : std::wstring();
+    return (dev >= 0 && dev < (int)devices.size()) ? devices[dev].id : std::wstring();
+}
+
+// Descobre os dispositivos que o driver usaria com as escolhas atuais da tela.
+static void UpdateResolvedDevices(HWND hWnd, DialogState* st) {
+    st->renderId.clear();
+    st->captureId.clear();
+    IMMDeviceEnumerator* pEnum = nullptr;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                                __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&pEnum))) || !pEnum) return;
+    wchar_t name[128] = {};
+    if (IMMDevice* dev = ResolveAudioEndpoint(pEnum, eRender, SelectedDeviceId(hWnd, IDC_CMB_OUT_DEV, st->outputDevices).c_str(), name, 128)) {
+        st->renderId = EndpointId(dev);
+        dev->Release();
+    }
+    if (IMMDevice* dev = ResolveAudioEndpoint(pEnum, eCapture, SelectedDeviceId(hWnd, IDC_CMB_IN_DEV, st->inputDevices).c_str(), name, 128)) {
+        st->captureId = EndpointId(dev);
+        dev->Release();
+    }
+    pEnum->Release();
 }
 
 // Mostra o efeito do volume do Windows sobre o áudio da DAW.
 static void UpdateVolumeStatus(HWND hWnd, DialogState* st, bool withMixRate = true) {
-    const OutputDeviceInfo info = QueryOutputDevice(SelectedOutputId(hWnd, st), withMixRate);
+    const OutputDeviceInfo info = QueryOutputDevice(SelectedDeviceId(hWnd, IDC_CMB_OUT_DEV, st->outputDevices), withMixRate);
     if (info.mixRate > 0) st->mixRate = info.mixRate;
 
     HWND hCmbMod = GetDlgItem(hWnd, IDC_CMB_WASAPI_MODE);
@@ -864,6 +1038,7 @@ static void PopulatePanelControls(HWND hWnd, DialogState* st) {
     SendMessageW(hCmbMode, CB_SETITEMDATA, idx, (LPARAM)1);
     SendMessageW(hCmbMode, CB_SETCURSEL, cfg.useExclusiveMode ? 1 : 0, 0);
 
+    UpdateResolvedDevices(hWnd, st);
     UpdateVolumeStatus(hWnd, st);   // também descobre a taxa do Windows usada abaixo
     UpdateLatencyDisplay(hWnd, st);
 }
@@ -977,6 +1152,7 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
         }
 
         if (code == CBN_SELCHANGE) {
+            if (id == IDC_CMB_OUT_DEV || id == IDC_CMB_IN_DEV) UpdateResolvedDevices(hWnd, pState);
             if (id == IDC_CMB_OUT_DEV || id == IDC_CMB_WASAPI_MODE) UpdateVolumeStatus(hWnd, pState);
             UpdateLatencyDisplay(hWnd, pState);
         }
@@ -1076,6 +1252,7 @@ static LRESULT CALLBACK PanelWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_BUFFER_SIZE), CB_SETCURSEL, 0, 0); // Auto
             SendMessageW(GetDlgItem(hWnd, IDC_CMB_WASAPI_MODE), CB_SETCURSEL, 0, 0); // Shared
             SetInputControlsEnabled(hWnd, true);
+            UpdateResolvedDevices(hWnd, pState);
             UpdateVolumeStatus(hWnd, pState);
             UpdateLatencyDisplay(hWnd, pState);
             return 0;

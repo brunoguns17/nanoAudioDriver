@@ -244,8 +244,6 @@ public:
 
 private:
     bool  ProbeHardwareCapabilities();
-    static IMMDevice* ResolveEndpoint(IMMDeviceEnumerator* pEnum, EDataFlow dataFlow, const wchar_t* preferredId, bool preferUsbForInput, wchar_t* outName, size_t maxNameLen);
-    static void GetEndpointFriendlyName(IMMDevice* pDevice, wchar_t* outName, size_t maxLen);
     static DWORD WINAPI AudioThreadProc(LPVOID param);
     DWORD RunRealTimeAudioLoop();
     long  ActiveInputCount() const;

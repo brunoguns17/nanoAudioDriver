@@ -102,7 +102,7 @@ Esse modo não instala o aviso de atualizações.
 
 O driver inclui um Painel de Controle nativo em Win32 que pode ser aberto tanto de **dentro de qualquer DAW** (ao clicar em *Control Panel* / *Driver Settings*) quanto diretamente pelo **Menu Iniciar** ou área de trabalho via **`nanoAudioControlPanel.exe`**.
 
-O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo WASAPI à direita) e mostra no cabeçalho a **latência por buffer** e, abaixo, o **total mínimo de ida e volta**, recalculados ao vivo conforme o buffer, o sample rate e o modo escolhidos (a cor segue o total: verde até 40 ms, amarelo até 60 ms, vermelho acima disso). O total inclui o que o mixer do Windows acrescenta, por isso no modo compartilhado muda pouco entre buffers pequenos; drivers USB antigos somam a própria latência. Com o áudio rodando, o driver mede a latência real e a informa à DAW, que a usa para alinhar as gravações. A janela usa o visual moderno do Windows; o `nanoAudioControlPanel.exe` fica nítido em telas com zoom de 125%, 150% etc. (dentro da DAW, a nitidez depende do modo de DPI da própria DAW).
+O painel tem duas colunas (dispositivos à esquerda; latência, formato e modo WASAPI à direita) e mostra no cabeçalho a **latência por buffer** (verde até 5 ms, amarelo até 12,5 ms, vermelho acima disso) e, abaixo, o **total de entrada e saída que a DAW mostra**, recalculados ao vivo conforme o buffer, o sample rate e o modo escolhidos. O total é *mínimo* até o driver medir os dispositivos e *medido* depois disso. Ele inclui o que o mixer do Windows acrescenta, por isso no modo compartilhado muda pouco entre buffers pequenos; drivers USB antigos somam a própria latência. Com o áudio rodando, o driver mede a latência real e a informa à DAW, que a usa para alinhar as gravações. A janela usa o visual moderno do Windows; o `nanoAudioControlPanel.exe` fica nítido em telas com zoom de 125%, 150% etc. (dentro da DAW, a nitidez depende do modo de DPI da própria DAW).
 
 ### O que pode ser configurado:
 1. **🎧 Saída de Áudio (Playback):** Escolha qual placa ou interface reproduz o som (ex: *BEHRINGER USB Audio*, *Alto-falantes Realtek*, etc.) ou mantenha no *Padrão do Windows*.
@@ -161,6 +161,8 @@ O painel só lê esse arquivo local: nenhum acesso à internet acontece dentro d
 ---
 
 ## Como Configurar nas Principais DAWs
+
+* **Reaper:** em *Options > Preferences > Audio > Device*, deixe **Request sample rate** e **Request block size** desmarcados. Marcados, eles impõem os valores do Reaper e ignoram o painel.
 
 * **Reaper, FL Studio, Cubase e Studio One:** Abra as preferências de áudio da DAW, escolha **ASIO** como tipo de driver e selecione **nanoAudio** (ou **nanoAudio ASIO**). Clique no botão **Control Panel / Show ASIO Panel** para abrir o Painel de Controle gráfico e configurar entrada, saída, sample rate, resolução e latência. Ao clicar em **Salvar e aplicar**, o driver reconfigura a DAW automaticamente via `kAsioResetRequest`.
 
