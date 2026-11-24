@@ -418,10 +418,10 @@ static void UpdateLatencyDisplay(HWND hWnd, DialogState* pState) {
     const double oneWayMs     = (static_cast<double>(bufFrames) * 1000.0) / static_cast<double>(sr);
     const double roundTripMs  = (static_cast<double>(est.inputFrames + est.outputFrames) * 1000.0) / static_cast<double>(sr);
 
-    // Leitura grande no cabeçalho
-    std::swprintf(pState->readoutText, 32, L"%.0f ms", roundTripMs);
-    std::swprintf(pState->readoutCaption, 128, L"latência mínima de ida e volta  ·  modo %ls",
-                  exclusive ? L"exclusivo" : L"compartilhado");
+    // Cabeçalho: o buffer em destaque e, abaixo, o total (a cor acompanha o total)
+    std::swprintf(pState->readoutText, 32, L"%.1f ms", oneWayMs);
+    std::swprintf(pState->readoutCaption, 128, L"por buffer  ·  total mínimo %.0f ms ida e volta (%ls)",
+                  roundTripMs, exclusive ? L"exclusivo" : L"compartilhado");
     pState->readoutColor = (roundTripMs <= 40.0) ? Palette::LatGood
                          : (roundTripMs <= 60.0) ? Palette::LatOk
                                                  : Palette::LatHigh;
